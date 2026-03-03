@@ -53,7 +53,7 @@ def test_doctor_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = CliRunner().invoke(doctor_cmd, [])
     assert result.exit_code == 0
-    assert "\u2705" in result.output
+    assert "[ok]" in result.output
     assert "platform" in result.output
     assert "replay-support" in result.output
 
@@ -126,8 +126,8 @@ class TestWinPythonVersion:
         assert "3.12" in r.detail
         assert "matches" in r.detail
 
-    def test_pyd_version_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """TP-W3-003: pyd version mismatches running Python."""
+    def test_pyd_version_mismatch_falls_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TP-W3-003: tagged pyd mismatches running Python, falls through to plain pyd."""
         monkeypatch.setattr("rdc.commands.doctor.sys.platform", "win32")
         monkeypatch.setattr("rdc._platform.renderdoc_search_paths", lambda: [r"C:\RenderDoc"])
         monkeypatch.setattr(
@@ -136,19 +136,48 @@ class TestWinPythonVersion:
         )
         vi = type("VI", (), {"__getitem__": lambda s, k: (3, 12)[k]})()
         monkeypatch.setattr("rdc.commands.doctor.sys.version_info", vi)
+        monkeypatch.setattr("rdc.commands.doctor.Path.is_file", lambda _self: False)
         r = _check_win_python_version()
         assert r.ok is False
-        assert "3.12" in r.detail
-        assert "3.10" in r.detail
+        assert "not found" in r.detail.lower()
+
+    def test_pyd_mismatch_fallback_to_plain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Tagged pyd mismatches but plain renderdoc.pyd exists -- accept MSBuild output."""
+        monkeypatch.setattr("rdc.commands.doctor.sys.platform", "win32")
+        monkeypatch.setattr("rdc._platform.renderdoc_search_paths", lambda: [r"C:\RenderDoc"])
+        monkeypatch.setattr(
+            "rdc.commands.doctor.glob.glob",
+            lambda _pattern: [r"C:\RenderDoc\renderdoc.cpython-310-win_amd64.pyd"],
+        )
+        vi = type("VI", (), {"__getitem__": lambda s, k: (3, 12)[k]})()
+        monkeypatch.setattr("rdc.commands.doctor.sys.version_info", vi)
+        monkeypatch.setattr("rdc.commands.doctor.Path.is_file", lambda _self: True)
+        r = _check_win_python_version()
+        assert r.ok is True
+        assert "MSBuild" in r.detail
 
     def test_no_pyd_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """TP-W3-004: no .pyd found in search paths."""
         monkeypatch.setattr("rdc.commands.doctor.sys.platform", "win32")
         monkeypatch.setattr("rdc._platform.renderdoc_search_paths", lambda: [r"C:\RenderDoc"])
         monkeypatch.setattr("rdc.commands.doctor.glob.glob", lambda _pattern: [])
+        monkeypatch.setattr("rdc.commands.doctor.Path.is_file", lambda _self: False)
         r = _check_win_python_version()
         assert r.ok is False
         assert "not found" in r.detail.lower()
+
+    def test_msbuild_plain_pyd_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """MSBuild-produced renderdoc.pyd (no cpython tag) is accepted."""
+        monkeypatch.setattr("rdc.commands.doctor.sys.platform", "win32")
+        (tmp_path / "renderdoc.pyd").write_text("fake")
+        monkeypatch.setattr("rdc._platform.renderdoc_search_paths", lambda: [str(tmp_path)])
+        monkeypatch.setattr("rdc.commands.doctor.glob.glob", lambda _pattern: [])
+        r = _check_win_python_version()
+        assert r.ok is True
+        assert "MSBuild" in r.detail
+        assert "renderdoc.pyd" in r.detail
 
 
 # ── Group X: _check_win_vs_build_tools() ──────────────────────────────
