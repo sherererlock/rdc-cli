@@ -30,7 +30,7 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
 
-RDOC_TAG = "v1.41"
+RDOC_TAG = "v1.43"
 RDOC_REPO = "https://github.com/baldurk/renderdoc.git"
 SWIG_URL = "https://github.com/baldurk/swig/archive/renderdoc-modified-7.zip"
 SWIG_SHA256 = "9d7e5013ada6c42ec95ab167a34db52c1cc8c09b89c8e9373631b1f10596c648"
