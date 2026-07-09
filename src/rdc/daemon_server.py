@@ -549,6 +549,27 @@ def _cleanup_temp_capture(state: DaemonState) -> None:
     state.local_capture_is_temp = False
 
 
+# RenderDoc's RemoteServer.TimeoutMS config (default 5000) governs how long the client
+# socket blocks on each recv() -- including while waiting for LogOpenProgress packets
+# during RemoteServer.OpenCapture. Opening a large capture on a slow/mobile replay host
+# can go 5+ seconds between progress packets (observed: a single "chunk initialisation"
+# phase took ~13s on an Android device), which trips the default timeout and surfaces as
+# a spurious "Network I/O operation failed" even though nothing is actually wrong.
+_REMOTE_TIMEOUT_MS = 60_000
+
+
+def _raise_remote_timeout(rd: Any) -> None:
+    """Raise RenderDoc's client-side RemoteServer.TimeoutMS, without lowering a value the
+    user already customised higher, and without persisting the change to renderdoc.conf.
+    """
+    try:
+        setting = rd.SetConfigSetting("RemoteServer.TimeoutMS")
+        if setting is not None and setting.data.basic.u < _REMOTE_TIMEOUT_MS:
+            setting.data.basic.u = _REMOTE_TIMEOUT_MS
+    except Exception:  # noqa: BLE001
+        _log.debug("could not raise RemoteServer.TimeoutMS", exc_info=True)
+
+
 def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
     """Connect to remote RenderDoc server and open capture for replay.
 
@@ -569,6 +590,8 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
     rd = find_renderdoc()
     if rd is None:
         return "failed to import renderdoc module"
+
+    _raise_remote_timeout(rd)
 
     try:
         rd.InitialiseReplay(rd.GlobalEnvironment(), [])
@@ -615,30 +638,14 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
                 state.local_capture_path = str(local_tmp)
                 state.local_capture_is_temp = True
 
-            step = "match gpu"
+            # No GPU force here: replay executes on the remote device (see
+            # RemoteServer.OpenCapture), so forceGPUVendor/forceGPUDeviceID must name a
+            # GPU available *there*. cap.GetAvailableGPUs() only ever enumerates GPUs on
+            # this (local) machine -- forcing one of those onto the remote device's
+            # OpenCapture request names a GPU it doesn't have. Leave remote_opts at its
+            # defaults so the remote renderdoccmd auto-selects its own GPU, same as
+            # 'rdc remote capture' already does.
             remote_opts = rd.ReplayOptions()
-            if state.local_capture_path:
-                try:
-                    tmp_cap = rd.OpenCaptureFile()
-                    try:
-                        open_result = tmp_cap.OpenFile(state.local_capture_path, "", None)
-                        if open_result == rd.ResultCode.Succeeded:
-                            gpu = _match_capture_gpu(
-                                tmp_cap, tmp_cap.GetStructuredData(), rd, state.gpu_pref or None
-                            )
-                            if gpu is not None:
-                                remote_opts.forceGPUVendor = gpu.vendor
-                                remote_opts.forceGPUDeviceID = gpu.deviceID
-                                _log.info(
-                                    "remote replay GPU: %s (vendor=%d id=%d)",
-                                    gpu.name,
-                                    gpu.vendor,
-                                    gpu.deviceID,
-                                )
-                    finally:
-                        tmp_cap.Shutdown()
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("GPU probe skipped: %s: %s", type(exc).__name__, exc)
 
             step = "open remote capture"
             result, controller = remote.OpenCapture(
@@ -689,24 +696,7 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
             return f"remote replay setup failed at step '{step}' ({type(exc).__name__}): {exc}"
         return None
 
-    # The Android/adb-forward remote-replay tunnel intermittently fails partway
-    # through connecting -- either CreateRemoteServerConnection or the later
-    # OpenCapture RPC returns "Network I/O operation failed", even though the
-    # capture data itself transfers fine. A quick reconnect-in-place is NOT
-    # enough -- retry the ENTIRE flow (fresh connection, fresh upload, fresh
-    # open) from scratch with growing backoff, giving the device-side tunnel
-    # real time to settle.
-    max_full_attempts = 4
-    backoff_schedule = [5, 15, 30]
-    last_error = "unknown error"
-    for full_attempt in range(1, max_full_attempts + 1):
-        last_error = _attempt()
-        if last_error is None:
-            return None
-        _log.warning("attempt %d/%d: %s", full_attempt, max_full_attempts, last_error)
-        if full_attempt < max_full_attempts:
-            time.sleep(backoff_schedule[full_attempt - 1])
-    return last_error
+    return _attempt()
 
 
 def _handle_request(request: dict[str, Any], state: DaemonState) -> tuple[dict[str, Any], bool]:

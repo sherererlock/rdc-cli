@@ -9,6 +9,15 @@ from click.shell_completion import CompletionItem
 
 from rdc import _platform
 from rdc.commands._helpers import complete_eid
+from rdc.remote_core import (
+    adb_forwarded_port as _adb_forwarded_port,
+)
+from rdc.remote_core import (
+    android_serial as _android_serial,
+)
+from rdc.remote_core import (
+    is_android_state as _is_android_state,
+)
 from rdc.remote_state import RemoteServerState
 from rdc.services.session_service import (
     close_session,
@@ -19,42 +28,6 @@ from rdc.services.session_service import (
     status_session,
 )
 from rdc.session_state import session_path
-
-
-def _is_android_state(state: RemoteServerState) -> bool:
-    """Check if a RemoteServerState is from an Android device."""
-    if state.host.startswith("adb://"):
-        return True
-    # Bare serial from adb fallback: port=0 and no colon (not host:port)
-    return state.port == 0 and ":" not in state.host and "." not in state.host
-
-
-def _android_serial(state: RemoteServerState) -> str:
-    """Extract bare serial from state host."""
-    return state.host.removeprefix("adb://")
-
-
-def _adb_forwarded_port(serial: str) -> int | None:
-    """Look up the adb-forwarded TCP port for a device serial."""
-    import subprocess  # noqa: PLC0415
-
-    try:
-        proc = subprocess.run(
-            ["adb", "forward", "--list"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    for line in proc.stdout.strip().splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == serial and parts[1].startswith("tcp:"):
-            try:
-                return int(parts[1].removeprefix("tcp:"))
-            except ValueError:
-                continue
-    return None
 
 
 def _resolve_android_url(serial: str | None) -> str:
@@ -256,6 +229,12 @@ def open_cmd(
     # already running, so it cannot apply here.
     if gpu is not None and connect is not None:
         click.echo("warning: --gpu is ignored with --connect", err=True)
+
+    # --gpu matches against locally-enumerated GPUs, which is meaningless once
+    # replay executes on a remote host (--proxy/--android): the daemon has no
+    # way to enumerate the remote machine's GPUs.
+    if gpu is not None and proxy_url is not None:
+        click.echo("warning: --gpu is ignored with --proxy/--android", err=True)
 
     # Dispatch: --connect
     if connect is not None:

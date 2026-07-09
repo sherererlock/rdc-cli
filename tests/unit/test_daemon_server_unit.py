@@ -341,55 +341,6 @@ class TestMatchCaptureGpu:
         assert _resolve_gpu_pref(gpus, "nope") is None
         assert _resolve_gpu_pref(gpus, "") is None
 
-    def test_remote_replay_passes_sd(self, monkeypatch: Any) -> None:
-        """The remote-replay call site must pass non-None sd and rd to the matcher."""
-        import mock_renderdoc as mock_rd
-
-        captured: dict[str, Any] = {}
-
-        def _spy(cap: Any, sd: Any = None, rd: Any = None, pref: Any = None) -> Any:
-            captured["cap"] = cap
-            captured["sd"] = sd
-            captured["rd"] = rd
-            captured["pref"] = pref
-            return None
-
-        monkeypatch.setattr("rdc.daemon_server._match_capture_gpu", _spy)
-
-        # Force the remote connection to succeed and short-circuit OpenCapture so
-        # the function exits cleanly after the spy is called. Names mirror the
-        # renderdoc CamelCase API.
-        remote = SimpleNamespace(
-            CopyCaptureToRemote=lambda path, cb: path,
-            CopyCaptureFromRemote=lambda path, dst, cb: None,
-            OpenCapture=lambda pref, path, opts, cb: (mock_rd.ResultCode.InternalError, None),
-            ShutdownConnection=lambda: None,
-            Ping=lambda: None,
-        )
-
-        def _create_remote(url: str) -> tuple[Any, Any]:
-            return mock_rd.ResultCode.Succeeded, remote
-
-        monkeypatch.setattr(mock_rd, "CreateRemoteServerConnection", _create_remote, raising=False)
-
-        # Make local_capture exist so the upload branch is taken.
-        cap_path = Path("test.rdc")
-        cap_path.write_bytes(b"\x00")
-        try:
-            sys.modules["renderdoc"] = mock_rd  # type: ignore[assignment]
-            try:
-                from rdc.daemon_server import _load_remote_replay
-
-                state = DaemonState(capture=str(cap_path), current_eid=0, token="tok")
-                _load_remote_replay(state, "remote://example")
-            finally:
-                sys.modules.pop("renderdoc", None)
-        finally:
-            cap_path.unlink(missing_ok=True)
-
-        assert captured.get("sd") is not None
-        assert captured.get("rd") is mock_rd
-
     def test_remote_replay_normalizes_localhost(self, monkeypatch: Any) -> None:
         """localhost:PORT reaches CreateRemoteServerConnection as 127.0.0.1:PORT."""
         import mock_renderdoc as mock_rd
@@ -409,7 +360,6 @@ class TestMatchCaptureGpu:
             return mock_rd.ResultCode.Succeeded, remote
 
         monkeypatch.setattr(mock_rd, "CreateRemoteServerConnection", _create_remote, raising=False)
-        monkeypatch.setattr("rdc.daemon_server._match_capture_gpu", lambda *a, **k: None)
 
         cap_path = Path("test.rdc")
         cap_path.write_bytes(b"\x00")

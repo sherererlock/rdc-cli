@@ -16,6 +16,7 @@ from rdc.capture_core import (
     build_capture_options,
     run_target_control_loop,
 )
+from rdc.remote_state import RemoteServerState
 
 _PRIVATE_NETS = (
     re.compile(r"^10\."),
@@ -111,6 +112,61 @@ def parse_url(url: str) -> tuple[str, int]:
             raise ValueError(f"invalid port: {port_str!r}")
         return _normalize_remote_host(host), port
     return _normalize_remote_host(url), DEFAULT_PORT
+
+
+def is_android_state(state: RemoteServerState) -> bool:
+    """Return True if a saved RemoteServerState originated from 'rdc android setup'."""
+    if state.host.startswith("adb://"):
+        return True
+    # Bare serial fallback: sentinel port=0, host has no ":" or "." (not host:port, not an IP)
+    return state.port == 0 and ":" not in state.host and "." not in state.host
+
+
+def android_serial(state: RemoteServerState) -> str:
+    """Extract the bare adb serial from an Android RemoteServerState."""
+    return state.host.removeprefix("adb://")
+
+
+def adb_forwarded_port(serial: str) -> int | None:
+    """Look up the current adb-forwarded TCP port for a device serial."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        proc = subprocess.run(
+            ["adb", "forward", "--list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    for line in proc.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == serial and parts[1].startswith("tcp:"):
+            try:
+                return int(parts[1].removeprefix("tcp:"))
+            except ValueError:
+                continue
+    return None
+
+
+def resolve_android_target(state: RemoteServerState) -> tuple[str, int]:
+    """Resolve a bare-serial Android RemoteServerState to a live host:port via adb forward.
+
+    The port saved by 'rdc android setup' can go stale (adb server restart, device
+    reconnect), so this re-queries 'adb forward --list' at use time instead of trusting
+    the saved sentinel.
+
+    Raises:
+        RuntimeError: If no adb forward is currently set up for the device.
+    """
+    serial = android_serial(state)
+    port = adb_forwarded_port(serial)
+    if port is None:
+        raise RuntimeError(
+            f"adb forward not found for {serial}; run: rdc android setup --serial {serial}"
+        )
+    return "127.0.0.1", port
 
 
 def connect_remote_server(rd: Any, url: str) -> Any:

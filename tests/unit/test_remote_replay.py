@@ -5,18 +5,26 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from rdc.daemon_server import (
+    _REMOTE_TIMEOUT_MS,
     DaemonState,
     _load_remote_replay,
     _load_replay,
+    _raise_remote_timeout,
     _start_ping_thread,
     _stop_ping_thread,
 )
+
+
+def _fake_setting(value: int) -> Any:
+    """A minimal stand-in for the SDObject SetConfigSetting() returns."""
+    return SimpleNamespace(data=SimpleNamespace(basic=SimpleNamespace(u=value)))
 
 
 def _make_mock_rd(
@@ -49,14 +57,6 @@ def _make_mock_rd(
     rd.GetVersionString.return_value = "1.41"
 
     return rd, mock_remote
-
-
-@pytest.fixture(autouse=True)
-def _no_backoff_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_load_remote_replay retries the whole flow up to 4x with a 5/15/30s
-    backoff on failure. Tests exercise deterministic (always-fail) mocks, so
-    without this they'd really sleep up to 50s per failing-path test."""
-    monkeypatch.setattr("rdc.daemon_server.time.sleep", lambda _seconds: None)
 
 
 class TestLoadRemoteReplay:
@@ -151,8 +151,7 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "at step 'download capture'" in err
-        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
-        assert mock_remote.ShutdownConnection.call_count == 4
+        assert mock_remote.ShutdownConnection.call_count == 1
 
     def test_open_capture_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         rd, mock_remote = _make_mock_rd(open_capture_result=1)
@@ -164,8 +163,7 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "remote OpenCapture failed" in err
-        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
-        assert mock_remote.ShutdownConnection.call_count == 4
+        assert mock_remote.ShutdownConnection.call_count == 1
 
     def test_local_openfile_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         rd, mock_remote = _make_mock_rd(open_file_result=1)
@@ -177,9 +175,8 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "local OpenFile (metadata) failed" in err
-        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
-        assert mock_remote.CloseCapture.call_count == 4
-        assert mock_remote.ShutdownConnection.call_count == 4
+        assert mock_remote.CloseCapture.call_count == 1
+        assert mock_remote.ShutdownConnection.call_count == 1
 
     def test_success_sets_state_fields(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -201,6 +198,87 @@ class TestLoadRemoteReplay:
         assert state.cap is not None
         assert state._ping_thread is not None
 
+    def test_does_not_force_a_local_gpu_onto_remote_opencapture(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Regression: replay executes on the remote device, so forceGPUVendor/
+        forceGPUDeviceID must not be set from this machine's GetAvailableGPUs()."""
+        rd, mock_remote = _make_mock_rd()
+        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
+
+        def _boom_match(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("_match_capture_gpu must not run for remote replay")
+
+        monkeypatch.setattr("rdc.daemon_server._match_capture_gpu", _boom_match)
+
+        local_capture = tmp_path / "frame.rdc"
+        local_capture.write_bytes(b"\x00")
+        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
+
+        with patch("rdc.daemon_server._init_adapter_state"):
+            err = _load_remote_replay(state, "host:39920")
+
+        assert err is None
+        # _boom_match would have raised above if the remote path still probed a local
+        # GPU. The only remaining local OpenCaptureFile call is "open local metadata".
+        assert rd.OpenCaptureFile.call_count == 1
+        assert mock_remote.OpenCapture.call_count == 1
+
+    def test_raises_remote_timeout_before_connecting(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """RemoteServer.TimeoutMS defaults to 5000ms, shorter than the gaps between
+        LogOpenProgress packets a slow/mobile replay host can leave while opening a large
+        capture -- raise it before RENDERDOC_CreateRemoteServerConnection reads it."""
+        rd, _mock_remote = _make_mock_rd()
+        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
+        setting = _fake_setting(5000)
+        rd.SetConfigSetting.return_value = setting
+
+        local_capture = tmp_path / "frame.rdc"
+        local_capture.write_bytes(b"\x00")
+        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
+
+        with patch("rdc.daemon_server._init_adapter_state"):
+            err = _load_remote_replay(state, "host:39920")
+
+        assert err is None
+        rd.SetConfigSetting.assert_called_once_with("RemoteServer.TimeoutMS")
+        assert setting.data.basic.u == _REMOTE_TIMEOUT_MS
+
+
+class TestRaiseRemoteTimeout:
+    def test_raises_low_timeout(self) -> None:
+        setting = _fake_setting(5000)
+        rd = MagicMock()
+        rd.SetConfigSetting.return_value = setting
+
+        _raise_remote_timeout(rd)
+
+        rd.SetConfigSetting.assert_called_once_with("RemoteServer.TimeoutMS")
+        assert setting.data.basic.u == _REMOTE_TIMEOUT_MS
+
+    def test_does_not_lower_an_existing_higher_value(self) -> None:
+        setting = _fake_setting(120_000)
+        rd = MagicMock()
+        rd.SetConfigSetting.return_value = setting
+
+        _raise_remote_timeout(rd)
+
+        assert setting.data.basic.u == 120_000
+
+    def test_missing_config_setting_is_non_fatal(self) -> None:
+        rd = MagicMock()
+        rd.SetConfigSetting.return_value = None
+
+        _raise_remote_timeout(rd)  # must not raise
+
+    def test_set_config_setting_unavailable_is_non_fatal(self) -> None:
+        rd = MagicMock()
+        rd.SetConfigSetting.side_effect = AttributeError("no such API on this renderdoc build")
+
+        _raise_remote_timeout(rd)  # must not raise
+
 
 class TestLoadRemoteReplayStepLabels:
     """T24 group C: step labels in remote replay setup failure messages."""
@@ -220,8 +298,7 @@ class TestLoadRemoteReplayStepLabels:
         assert err is not None
         assert "at step 'upload capture'" in err
         assert "upload bang" in err
-        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
-        assert mock_remote.ShutdownConnection.call_count == 4
+        assert mock_remote.ShutdownConnection.call_count == 1
 
     def test_upload_capture_os_error_step_label(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -238,109 +315,6 @@ class TestLoadRemoteReplayStepLabels:
         assert err is not None
         assert "at step 'upload capture'" in err
         assert "disk full" in err
-
-    def test_gpu_probe_failure_is_non_fatal(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """GPU probe errors are swallowed into a warning; setup continues."""
-        rd, _mock_remote = _make_mock_rd()
-        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
-
-        def _boom_match(_cap: Any, _sd: Any = None) -> Any:
-            raise RuntimeError("gpu probe bang")
-
-        monkeypatch.setattr("rdc.daemon_server._match_capture_gpu", _boom_match)
-
-        local_capture = tmp_path / "frame.rdc"
-        local_capture.write_bytes(b"\x00")
-        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
-
-        with caplog.at_level(logging.WARNING, logger="rdc.daemon"):
-            with patch("rdc.daemon_server._init_adapter_state"):
-                err = _load_remote_replay(state, "host:39920")
-
-        assert err is None
-        assert any("GPU probe skipped" in r.message for r in caplog.records)
-
-    def test_gpu_probe_tmp_cap_shutdown_on_openfile_success(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """T24 group E: tmp_cap.Shutdown runs after a successful OpenFile probe."""
-        rd, _mock_remote = _make_mock_rd()
-        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
-
-        tmp_cap = MagicMock()
-        tmp_cap.OpenFile.return_value = rd.ResultCode.Succeeded
-
-        cap_for_metadata = MagicMock()
-        cap_for_metadata.OpenFile.return_value = rd.ResultCode.Succeeded
-        rd.OpenCaptureFile.side_effect = [tmp_cap, cap_for_metadata]
-
-        local_capture = tmp_path / "frame.rdc"
-        local_capture.write_bytes(b"\x00")
-        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
-
-        with patch("rdc.daemon_server._init_adapter_state"):
-            err = _load_remote_replay(state, "host:39920")
-
-        assert err is None
-        tmp_cap.Shutdown.assert_called_once()
-
-    def test_gpu_probe_tmp_cap_shutdown_on_openfile_failure(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """T24 group E: tmp_cap.Shutdown still runs when OpenFile returns non-Succeeded."""
-        rd, _mock_remote = _make_mock_rd()
-        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
-
-        tmp_cap = MagicMock()
-        tmp_cap.OpenFile.return_value = 1  # anything != Succeeded (which is 0)
-
-        cap_for_metadata = MagicMock()
-        cap_for_metadata.OpenFile.return_value = rd.ResultCode.Succeeded
-        rd.OpenCaptureFile.side_effect = [tmp_cap, cap_for_metadata]
-
-        local_capture = tmp_path / "frame.rdc"
-        local_capture.write_bytes(b"\x00")
-        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
-
-        with patch("rdc.daemon_server._init_adapter_state"):
-            err = _load_remote_replay(state, "host:39920")
-
-        assert err is None
-        tmp_cap.Shutdown.assert_called_once()
-
-    def test_gpu_probe_tmp_cap_shutdown_when_match_raises(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """T24 group E: tmp_cap.Shutdown runs even when _match_capture_gpu raises."""
-        rd, _mock_remote = _make_mock_rd()
-        monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: rd)
-
-        tmp_cap = MagicMock()
-        tmp_cap.OpenFile.return_value = rd.ResultCode.Succeeded
-
-        cap_for_metadata = MagicMock()
-        cap_for_metadata.OpenFile.return_value = rd.ResultCode.Succeeded
-        rd.OpenCaptureFile.side_effect = [tmp_cap, cap_for_metadata]
-
-        def _boom_match(_cap: Any, _sd: Any = None) -> Any:
-            raise RuntimeError("gpu boom")
-
-        monkeypatch.setattr("rdc.daemon_server._match_capture_gpu", _boom_match)
-
-        local_capture = tmp_path / "frame.rdc"
-        local_capture.write_bytes(b"\x00")
-        state = DaemonState(capture=str(local_capture), current_eid=0, token="tok12345")
-
-        with patch("rdc.daemon_server._init_adapter_state"):
-            err = _load_remote_replay(state, "host:39920")
-
-        assert err is None
-        tmp_cap.Shutdown.assert_called_once()
 
     def test_outer_catchall_labels_init_adapter_state(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -363,8 +337,7 @@ class TestLoadRemoteReplayStepLabels:
         assert "at step 'init adapter state'" in err
         assert "ValueError" in err
         assert "adapter bang" in err
-        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
-        assert mock_remote.ShutdownConnection.call_count == 4
+        assert mock_remote.ShutdownConnection.call_count == 1
 
 
 class TestLoadReplayRegressionB39:

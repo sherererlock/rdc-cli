@@ -561,3 +561,45 @@ class TestProtocolUrl:
         result = CliRunner().invoke(remote_list_cmd, [])
         assert result.exit_code == 0
         assert captured_urls[0] == "adb://ABC123"
+
+
+# --- Bare-serial Android state (rdc android setup fallback, no adb:// prefix) ---
+
+
+class TestBareSerialAndroidState:
+    def test_resolve_url_resolves_via_adb_forward(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        save_remote_state(RemoteServerState(host="7044b9d5", port=0, connected_at=1000.0))
+        monkeypatch.setattr("rdc.remote_core.adb_forwarded_port", lambda serial: 45678)
+
+        assert _resolve_url(None) == ("127.0.0.1", 45678)
+
+    def test_remote_list_no_public_ip_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        save_remote_state(RemoteServerState(host="7044b9d5", port=0, connected_at=1000.0))
+        _mock_rd(monkeypatch)
+        _mock_remote_connection(monkeypatch)
+        monkeypatch.setattr("rdc.remote_core.adb_forwarded_port", lambda serial: 45678)
+        monkeypatch.setattr("rdc.commands.remote.enumerate_remote_targets", lambda rd, url: [])
+
+        stderr_lines: list[str] = []
+        orig_echo = click.echo
+
+        def spy_echo(message: Any = None, err: bool = False, **kw: Any) -> Any:
+            if err:
+                stderr_lines.append(str(message))
+            return orig_echo(message, err=err, **kw)
+
+        monkeypatch.setattr("rdc.commands.remote.click.echo", spy_echo)
+        result = CliRunner().invoke(remote_list_cmd, [])
+
+        assert result.exit_code == 0
+        assert not any("not a private IP" in s for s in stderr_lines)
+
+    def test_remote_list_no_forward_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        save_remote_state(RemoteServerState(host="7044b9d5", port=0, connected_at=1000.0))
+        _mock_rd(monkeypatch)
+        monkeypatch.setattr("rdc.remote_core.adb_forwarded_port", lambda serial: None)
+
+        result = CliRunner().invoke(remote_list_cmd, [])
+
+        assert result.exit_code == 1
+        assert "adb forward not found for 7044b9d5" in result.output

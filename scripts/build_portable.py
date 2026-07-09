@@ -6,7 +6,12 @@ or renderdoc.  Requires only Python 3.10+ stdlib to run.
 
 Usage::
 
-    python scripts/build_portable.py [--output DIR] [--python-version 3.14.4]
+    python scripts/build_portable.py [--output DIR] [--python-version X.Y.Z]
+
+The embeddable Python version is auto-detected from the renderdoc build's
+``python_version.txt`` metadata unless ``--python-version`` overrides it --
+renderdoc.pyd is ABI-locked to the Python that compiled it, so the two must
+match exactly.
 
 Prerequisites:
     - Compiled renderdoc artifacts at %LOCALAPPDATA%/rdc/renderdoc/
@@ -31,7 +36,6 @@ from urllib.request import urlretrieve
 # Defaults
 # ---------------------------------------------------------------------------
 
-_PYTHON_VERSION = "3.14.4"
 _PYTHON_EMBED_URL = (
     "https://www.python.org/ftp/python/{version}/python-{version}-embed-amd64.zip"
 )
@@ -67,6 +71,30 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 0: Detect required Python version from the renderdoc build
+# ---------------------------------------------------------------------------
+
+
+def detect_python_version(renderdoc_src: Path) -> str:
+    """Read the Python version that built renderdoc.pyd from its build metadata.
+
+    renderdoc.pyd is ABI-locked to the Python it was compiled against, so the
+    embeddable Python bundled here must match it exactly -- guessing/hardcoding
+    a version would silently produce a portable build whose renderdoc module
+    fails to import.
+    """
+    marker = renderdoc_src / "renderdoc" / "python_version.txt"
+    if not marker.exists():
+        sys.stderr.write(
+            f"ERROR: {marker} not found.\n"
+            "Rebuild renderdoc with the current build script (it records the "
+            "Python version used), or pass --python-version explicitly.\n"
+        )
+        raise SystemExit(1)
+    return marker.read_text(encoding="utf-8").strip()
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Python embeddable
 # ---------------------------------------------------------------------------
 
@@ -74,9 +102,19 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
 def step_download_python(out: Path, version: str) -> Path:
     """Download and extract Python embeddable package."""
     python_dir = out / "python"
+    major_minor = version.split(".")[:2]
+    pth_name = f"python{''.join(major_minor)}._pth"
+
     if python_dir.exists():
-        _log("[1/6] Python embeddable already present, skipping")
-        return python_dir
+        if (python_dir / pth_name).exists():
+            _log("[1/6] Python embeddable already present, skipping")
+            return python_dir
+        sys.stderr.write(
+            f"ERROR: {python_dir} exists but is not Python {version} "
+            f"(expected {pth_name}). Remove it and re-run to rebuild for the "
+            "renderdoc-matched version.\n"
+        )
+        raise SystemExit(1)
 
     _log(f"[1/6] Downloading Python {version} embeddable ...")
     url = _PYTHON_EMBED_URL.format(version=version)
@@ -92,8 +130,6 @@ def step_download_python(out: Path, version: str) -> Path:
         tmp.unlink(missing_ok=True)
 
     # Patch ._pth to enable site-packages (uncomment "import site")
-    major_minor = version.split(".")[:2]
-    pth_name = f"python{''.join(major_minor)}._pth"
     pth_file = python_dir / pth_name
     if pth_file.exists():
         content = pth_file.read_text(encoding="utf-8")
@@ -296,8 +332,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--python-version",
-        default=_PYTHON_VERSION,
-        help=f"Python embeddable version to download (default: {_PYTHON_VERSION})",
+        default=None,
+        help=(
+            "Python embeddable version to download. Defaults to whatever "
+            "version built renderdoc.pyd (read from its build metadata), "
+            "since the two must match exactly."
+        ),
     )
     parser.add_argument(
         "--renderdoc-dir",
@@ -316,7 +356,8 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"=== Building portable rdc-cli at {out} ===")
     out.mkdir(parents=True, exist_ok=True)
 
-    python_dir = step_download_python(out, args.python_version)
+    python_version = args.python_version or detect_python_version(args.renderdoc_dir)
+    python_dir = step_download_python(out, python_version)
     step_install_rdc(python_dir)
     step_copy_renderdoc(out, args.renderdoc_dir)
     step_copy_apk(out, args.renderdoc_dir)

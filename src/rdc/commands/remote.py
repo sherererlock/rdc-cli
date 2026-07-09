@@ -23,9 +23,11 @@ from rdc.remote_core import (
     build_conn_url,
     connect_remote_server,
     enumerate_remote_targets,
+    is_android_state,
     is_protocol_url,
     parse_url,
     remote_capture,
+    resolve_android_target,
     warn_if_public,
 )
 from rdc.remote_state import (
@@ -50,6 +52,12 @@ def _resolve_url(url: str | None) -> tuple[str, int]:
     if state is None:
         click.echo("error: no remote connection (run 'rdc remote connect' first)", err=True)
         raise SystemExit(1)
+    if is_android_state(state) and not is_protocol_url(state.host):
+        try:
+            return resolve_android_target(state)
+        except RuntimeError as exc:
+            click.echo(f"error: {exc}", err=True)
+            raise SystemExit(1) from None
     return state.host, state.port
 
 

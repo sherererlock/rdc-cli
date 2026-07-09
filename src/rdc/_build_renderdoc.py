@@ -814,6 +814,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if plat == "windows":
         _install_vulkan_layer(install_dir, build_dir, args.version)
+        # renderdoc.pyd is ABI-locked to the Python that built it; record the exact
+        # version so downstream tooling (e.g. build_portable.py) can match it instead
+        # of guessing/hardcoding a Python version to bundle.
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        (install_dir / "python_version.txt").write_text(py_version + "\n", encoding="utf-8")
 
     _log("=== Done ===")
     _log(f'  export RENDERDOC_PYTHON_PATH="{install_dir}"')
