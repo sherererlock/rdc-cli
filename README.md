@@ -7,13 +7,13 @@
 |_|  \_\_____/ \_____|  cli
 ```
 
-[!\[PyPI\](https://img.shields.io/pypi/v/rdc-cli null)](https://pypi.org/project/rdc-cli/)
-[!\[Python\](https://img.shields.io/badge/python-3.10%2B-blue null)](https://pypi.org/project/rdc-cli/)
-[!\[License\](https://img.shields.io/badge/license-MIT-green null)](LICENSE)
-[!\[Commands\](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/commands.json null)](https://bananasjim.github.io/rdc-cli/)
-[!\[Tests\](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/tests.json null)](https://bananasjim.github.io/rdc-cli/)
-[!\[Coverage\](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/coverage.json null)](https://bananasjim.github.io/rdc-cli/)
-[!\[Discord\](https://img.shields.io/discord/1485003415687008296?logo=discord\&label=Discord null)](https://discord.gg/h3zwUadp4k)
+[![PyPI](https://img.shields.io/pypi/v/rdc-cli)](https://pypi.org/project/rdc-cli/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/rdc-cli/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Commands](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/commands.json)](https://bananasjim.github.io/rdc-cli/)
+[![Tests](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/tests.json)](https://bananasjim.github.io/rdc-cli/)
+[![Coverage](https://img.shields.io/endpoint?url=https://bananasjim.github.io/rdc-cli/badges/coverage.json)](https://bananasjim.github.io/rdc-cli/)
+[![Discord](https://img.shields.io/discord/1485003415687008296?logo=discord&label=Discord)](https://discord.gg/h3zwUadp4k)
 
 **Turn RenderDoc captures into Unix text streams.** rdc-cli does not replace RenderDoc — it makes `.rdc` file contents accessible to `grep`, `awk`, `sort`, `diff`, `jq`, and AI agents.
 
@@ -115,7 +115,9 @@ rdc search "shadowMap"                # grep across all shaders in the frame
 ```bash
 rdc texture 5 -o albedo.png           # export a texture
 rdc rt 142 -o render.png              # export render target
+rdc rt 142 --depth -o depth.png       # export raw depth attachment
 rdc buffer 88 -o verts.bin            # export raw buffer
+rdc cbuffer 142 --stage ps --binding 0  # decode a constant buffer to JSON
 rdc snapshot 142 -o ./snap/           # pipeline + shaders + render targets
 rdc draws --json | jq '.[] | select(.triangles > 10000)'  # filter with jq
 ```
@@ -150,6 +152,9 @@ rdc-cli supports three deployment modes:
 | **Split** (`--listen`/`--connect`) | server         | server-local GPU             | **no**                  |
 
 ```bash
+# Multi-GPU host: force the replay GPU (0-based index, name, or device ID)
+rdc open frame.rdc --gpu 1
+
 # Proxy: local daemon, remote GPU (needs renderdoccmd on remote)
 rdc open frame.rdc --proxy gpu-server:39920
 
@@ -203,24 +208,24 @@ rdc-cli bridges that gap:
 
 Run `rdc --help` for the full list, or `rdc <command> --help` for details.  See the [full command reference](https://bananasjim.github.io/rdc-cli/docs/commands/) for every option.
 
-| Category       | Commands                                                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------- |
-| Session        | `open`, `close`, `status`, `goto`                                                                 |
-| Inspection     | `info`, `stats`, `events`, `draws`, `event`, `draw`, `log`                                        |
-| GPU state      | `pipeline`, `bindings`, `shader`, `shaders`, `shader-map`                                         |
-| Debug          | `debug pixel`, `debug vertex`, `debug thread`, `pixel`, `pick-pixel`, `tex-stats`                 |
-| Shader edit    | `shader-build`, `shader-replace`, `shader-restore`, `shader-restore-all`, `shader-encodings`      |
-| Resources      | `resources`, `resource`, `passes`, `pass`, `usage`, `unused-targets`                              |
-| Export         | `texture`, `rt`, `buffer`, `mesh`, `snapshot`                                                     |
-| Search         | `search`, `counters`                                                                              |
-| Assertions     | `assert-pixel`, `assert-state`, `assert-image`, `assert-count`, `assert-clean`                    |
-| Diff           | `diff` (with `--draws`, `--stats`, `--framebuffer`, `--pipeline`, etc.)                           |
-| VFS            | `ls`, `cat`, `tree`                                                                               |
-| Remote         | `remote connect`, `remote list`, `remote capture`                                                 |
-| Android        | `android setup`, `android stop`, `android capture`                                                |
-| Target control | `attach`, `capture-trigger`, `capture-list`, `capture-copy`                                       |
-| Capture file   | `sections`, `section`, `callstacks`, `gpus`, `thumbnail`                                          |
-| Utility        | `doctor`, `completion`, `capture`, `count`, `script`, `serve`, `setup-renderdoc`, `install-skill` |
+| Category       | Commands                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------- |
+| Session        | `open`, `close`, `status`, `goto`                                                                       |
+| Inspection     | `info`, `stats`, `events`, `draws`, `event`, `draw`, `log`                                              |
+| GPU state      | `pipeline`, `bindings`, `shader`, `shaders`, `shader-map`                                               |
+| Debug          | `debug pixel`, `debug vertex`, `debug thread`, `pixel`, `pick-pixel`, `tex-stats`                       |
+| Shader edit    | `shader-build`, `shader-replace`, `shader-restore`, `shader-restore-all`, `shader-encodings`            |
+| Resources      | `resources`, `resource`, `passes`, `pass`, `usage`, `unused-targets`                                    |
+| Export         | `texture`, `rt`, `buffer`, `cbuffer`, `mesh`, `snapshot`                                                |
+| Search         | `search`, `counters`                                                                                    |
+| Assertions     | `assert-pixel`, `assert-state`, `assert-image`, `assert-count`, `assert-clean`                          |
+| Diff           | `diff` (with `--draws`, `--stats`, `--framebuffer`, `--pipeline`, etc.)                                 |
+| VFS            | `ls`, `cat`, `tree`                                                                                     |
+| Remote         | `remote connect`, `remote list`, `remote capture`, `remote setup`, `remote status`, `remote disconnect` |
+| Android        | `android setup`, `android stop`, `android capture`                                                      |
+| Target control | `attach`, `capture-trigger`, `capture-list`, `capture-copy`                                             |
+| Capture file   | `sections`, `section`, `callstacks`, `gpus`, `thumbnail`                                                |
+| Utility        | `doctor`, `completion`, `capture`, `count`, `script`, `serve`, `setup-renderdoc`, `install-skill`       |
 
 All list commands output TSV. All commands support `--json`. Footer/summary goes to stderr — stdout is always clean data.
 

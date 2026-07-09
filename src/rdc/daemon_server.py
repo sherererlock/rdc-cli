@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from rdc import _platform
 from rdc._progress import make_progress_cb
@@ -72,6 +72,7 @@ __all__ = [
     "_seek_replay",
     "_set_frame_event",
     "_start_ping_thread",
+    "cleanup_state",
     "_stop_ping_thread",
     "main",
     "run_server",
@@ -141,6 +142,7 @@ class DaemonState:
     _debug_messages_cache: list[Any] | None = None
     remote: Any = None
     remote_url: str = ""
+    gpu_pref: str = ""
     is_remote: bool = False
     local_capture_path: str = ""
     local_capture_is_temp: bool = False
@@ -167,33 +169,217 @@ def _cleanup_temp(state: DaemonState) -> None:
 _log = logging.getLogger("rdc.daemon")
 
 
-def _match_capture_gpu(cap: Any, sd: Any = None) -> Any | None:
-    """Find the GPU used for capture by matching structured data against available GPUs."""
+class AdapterMatch(NamedTuple):
+    """Adapter identity parsed from a D3D12 structured-data chunk."""
+
+    description: str
+    device_id: int | None
+
+
+def _scalar_int(node: Any, name: str) -> int | None:
+    """Return the AsInt() value of a direct child ``name``, or None if absent."""
+    for i in range(node.NumChildren()):
+        child = node.GetChild(i)
+        if child.name == name:
+            return int(child.AsInt())
+    return None
+
+
+def _walk_adapter(node: Any, depth: int) -> AdapterMatch | None:
+    """Depth-bounded descent for a Description/DeviceName plus paired DeviceId."""
+    if depth < 0:
+        return None
+    for i in range(node.NumChildren()):
+        child = node.GetChild(i)
+        cname = child.name
+        if cname in ("Description", "DeviceName"):
+            value = child.AsString()
+            if value:
+                return AdapterMatch(str(value), _scalar_int(node, "DeviceId"))
+        if cname in ("AdapterDesc", "pAdapter", "adapter"):
+            found = _walk_adapter(child, depth - 1)
+            if found is not None:
+                return found
+    for i in range(node.NumChildren()):
+        found = _walk_adapter(node.GetChild(i), depth - 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _find_adapter_description(chunk: Any) -> AdapterMatch | None:
+    """Extract D3D12 adapter identity from a structured-data chunk subtree.
+
+    Recurses up to 5 levels for a ``Description``/``DeviceName`` field, pairing
+    it with a sibling ``DeviceId`` PCI scalar when present.
+
+    Args:
+        chunk: A renderdoc SDChunk (or SDObject) whose subtree may contain an
+            ``AdapterDesc``/``pAdapter``/``adapter`` node with a ``Description``
+            or ``DeviceName`` field at any depth, or a direct one.
+
+    Returns:
+        An :class:`AdapterMatch` when a description is found, otherwise ``None``.
+    """
+    try:
+        return _walk_adapter(chunk, 5)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("adapter-desc parse failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+
+def _resolve_gpu_pref(gpus: list[Any], pref: str) -> Any | None:
+    """Resolve a user ``--gpu`` preference against the available GPUs.
+
+    Accepts, in order: a 0-based index, a device ID (decimal or ``0x`` hex),
+    or a case-insensitive substring of the GPU name. Returns the matching
+    ``GPUDevice``, or ``None`` if nothing matches.
+    """
+    pref = pref.strip()
+    if not pref:
+        return None
+    if pref.isdigit() and int(pref) < len(gpus):
+        return gpus[int(pref)]
+    try:
+        want_id = int(pref, 0)
+    except ValueError:
+        want_id = None
+    if want_id is not None:
+        for g in gpus:
+            if g.deviceID == want_id:
+                return g
+    needle = pref.lower()
+    for g in gpus:
+        if needle in g.name.lower():
+            return g
+    return None
+
+
+def _match_capture_gpu(
+    cap: Any, sd: Any = None, rd: Any = None, pref: str | None = None
+) -> Any | None:
+    """Pick the replay GPU that produced ``cap``.
+
+    When *pref* is given (the user's ``--gpu``), it takes precedence over
+    auto-selection. Otherwise walks structured-data chunks to match the
+    capture's Vulkan ``vkEnumeratePhysicalDevices`` device name or the D3D12
+    adapter description, falling back to vendor priority (nVidia > AMD >
+    Intel, Software/WARP excluded) when no chunk-based match succeeds.
+
+    Args:
+        cap: An open renderdoc capture file.
+        sd: Optional structured data from ``cap.GetStructuredData()``.
+        rd: Optional renderdoc module, used for ``GPUVendor`` enum lookup.
+        pref: Optional user GPU preference (index, device ID, or name substring).
+
+    Returns:
+        The selected ``GPUDevice`` or ``None`` when no GPUs are available.
+    """
     try:
         gpus = cap.GetAvailableGPUs()
         if not gpus:
             return None
+        if pref:
+            chosen = _resolve_gpu_pref(gpus, pref)
+            if chosen is not None:
+                _log.info("replay GPU (user --gpu=%r): %s", pref, chosen.name)
+                return chosen
+            _log.warning(
+                "--gpu=%r matched no available GPU; available=%r -- using auto-selection",
+                pref,
+                [(g.name, g.deviceID) for g in gpus],
+            )
         if len(gpus) == 1:
             return gpus[0]
-        if sd is None:
+
+        saw_adapter_chunk = False
+        if sd is not None:
+            d3d_markers = (
+                "Driver Initialisation Parameters",  # renderdoc 1.42 D3D12 name
+                # Legacy markers: provably dead on renderdoc-1.42 D3D12 (the
+                # real chunk name has spaces). Retained for older/other
+                # renderdoc versions and API paths that still emit them.
+                "DriverInit",
+                "EnumAdapters",
+                "CreateDXGIFactory",
+            )
+            for i in range(len(sd.chunks)):
+                c = sd.chunks[i]
+                cname = c.name
+                if cname == "vkEnumeratePhysicalDevices":
+                    saw_adapter_chunk = True
+                    for j in range(c.NumChildren()):
+                        child = c.GetChild(j)
+                        if child.name == "physProps":
+                            for k in range(child.NumChildren()):
+                                prop = child.GetChild(k)
+                                if prop.name == "deviceName":
+                                    name = prop.AsString()
+                                    for g in gpus:
+                                        if g.name == name:
+                                            return g
+                    break
+                if any(marker in cname for marker in d3d_markers):
+                    saw_adapter_chunk = True
+                    match = _find_adapter_description(c)
+                    if match:
+                        # device_id 0 is the WARP/software sentinel: a present
+                        # but zero DXGI_ADAPTER_DESC.DeviceId must fall through
+                        # to name-substring, never bind the WARP adapter.
+                        if match.device_id:
+                            for g in gpus:
+                                if g.deviceID and g.deviceID == match.device_id:
+                                    return g
+                        desc_l = match.description.lower()
+                        for g in gpus:
+                            name_l = g.name.lower()
+                            if desc_l in name_l or name_l in desc_l:
+                                return g
+
+        if sd is not None and not saw_adapter_chunk:
+            _log.warning(
+                "no recognized adapter chunk (vk/d3d markers) in structured "
+                "data -- renderdoc version may have changed chunk naming; "
+                "falling back to vendor priority"
+            )
+
+        vendor_enum = getattr(rd, "GPUVendor", None) if rd is not None else None
+        nvidia = getattr(vendor_enum, "nVidia", 6)
+        amd = getattr(vendor_enum, "AMD", 2)
+        intel = getattr(vendor_enum, "Intel", 5)
+        software = getattr(vendor_enum, "Software", 9)
+        priority = {nvidia: 0, amd: 1, intel: 2}
+        available = [(g.name, g.vendor, g.deviceID) for g in gpus]
+        filtered = [g for g in gpus if g.vendor != software]
+        if not filtered:
+            _log.warning(
+                "GPU match fallback: no name/desc match and only software GPUs; "
+                "available=%r choosing gpus[0]=%s",
+                available,
+                gpus[0].name,
+            )
             return gpus[0]
-        for i in range(len(sd.chunks)):
-            c = sd.chunks[i]
-            if c.name == "vkEnumeratePhysicalDevices":
-                for j in range(c.NumChildren()):
-                    child = c.GetChild(j)
-                    if child.name == "physProps":
-                        for k in range(child.NumChildren()):
-                            prop = child.GetChild(k)
-                            if prop.name == "deviceName":
-                                name = prop.AsString()
-                                for g in gpus:
-                                    if g.name == name:
-                                        return g
-                break
-    except Exception:  # noqa: BLE001
-        pass
-    return gpus[0] if gpus else None
+        filtered.sort(key=lambda g: priority.get(g.vendor, 99))
+        chosen = filtered[0]
+        _log.warning(
+            "GPU match fallback: no name/desc match; available=%r choosing "
+            "vendor-priority %s (vendor=%d id=%d)",
+            available,
+            chosen.name,
+            chosen.vendor,
+            chosen.deviceID,
+        )
+        return chosen
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "GPU match raised %s: %s -- falling back to gpus[0]",
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            return gpus[0] if gpus else None
+        except NameError:
+            return None
 
 
 def _load_replay(state: DaemonState) -> str | None:
@@ -220,7 +406,7 @@ def _load_replay(state: DaemonState) -> str | None:
         return "local replay not supported on this platform"
 
     opts = rd.ReplayOptions()
-    gpu = _match_capture_gpu(cap, cap.GetStructuredData())
+    gpu = _match_capture_gpu(cap, cap.GetStructuredData(), rd, state.gpu_pref or None)
     if gpu is not None:
         opts.forceGPUVendor = gpu.vendor
         opts.forceGPUDeviceID = gpu.deviceID
@@ -228,7 +414,7 @@ def _load_replay(state: DaemonState) -> str | None:
     result, controller = cap.OpenCapture(opts, None)
     if result != rd.ResultCode.Succeeded:
         cap.Shutdown()
-        return f"OpenCapture failed: {result}"
+        return f"OpenCapture failed: {result} -- hint: try 'rdc open --proxy HOST:PORT'"
 
     state.cap = cap
     state.rd = rd
@@ -303,6 +489,55 @@ def _stop_ping_thread(state: DaemonState) -> None:
         state._ping_thread.join(timeout=5.0)
 
 
+def cleanup_state(state: DaemonState) -> None:
+    """Release all replay resources held by *state*.
+
+    Shared teardown for both the explicit ``shutdown`` RPC and the
+    idle-timeout exit path, so a daemon that times out still closes the
+    remote replay session (CloseCapture + ShutdownConnection) instead of
+    leaking it on the remoteserver. Every step is best-effort.
+    """
+    if state.replay_output is not None:
+        try:
+            state.replay_output.Shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        state.replay_output = None
+    if state.adapter is not None:
+        controller = state.adapter.controller
+        try:
+            for rid_obj in state.shader_replacements.values():
+                controller.RemoveReplacement(rid_obj)
+            for rid_obj in state.built_shaders.values():
+                controller.FreeTargetResource(rid_obj)
+        except Exception:  # noqa: BLE001
+            pass
+        state.shader_replacements.clear()
+        state.built_shaders.clear()
+    _cleanup_temp(state)
+    state.temp_dir = None
+    _cleanup_temp_capture(state)
+    if state.is_remote:
+        _stop_ping_thread(state)
+        if state.remote is not None and state.adapter is not None:
+            try:
+                state.remote.CloseCapture(state.adapter.controller)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                state.remote.ShutdownConnection()
+            except Exception:  # noqa: BLE001
+                pass
+    elif state.adapter is not None:
+        state.adapter.shutdown()
+    if state.cap is not None:
+        try:
+            state.cap.Shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        state.cap = None
+
+
 def _cleanup_temp_capture(state: DaemonState) -> None:
     """Remove temp metadata directory created for remote replay, if any."""
     if not state.local_capture_is_temp:
@@ -321,6 +556,16 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
     """
     from rdc.discover import find_renderdoc
 
+    # Normalize a literal localhost host portion to 127.0.0.1: the RenderDoc
+    # remote protocol is IPv4-only, but localhost resolves to ::1 first on
+    # dual-stack hosts, stalling forever. Plain string check leaves protocol
+    # URLs (adb://...), bracketed IPv6, and real hostnames untouched.
+    if remote_url.lower() == "localhost" or remote_url.lower().startswith("localhost:"):
+        remote_url = "127.0.0.1" + remote_url[len("localhost") :]
+        _log.debug(
+            "normalizing 'localhost' -> '127.0.0.1' (RenderDoc remote protocol is IPv4-only)"
+        )
+
     rd = find_renderdoc()
     if rd is None:
         return "failed to import renderdoc module"
@@ -338,12 +583,20 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
     state.is_remote = True
     state.remote_url = remote_url
 
+    step = "init"
+    controller = None
+    cap = None
     try:
+        step = "stage capture"
         local_capture = Path(state.capture)
         if local_capture.exists():
-            remote_path = remote.CopyCaptureToRemote(
-                str(local_capture), make_progress_cb("uploading")
-            )
+            try:
+                remote_path = remote.CopyCaptureToRemote(
+                    str(local_capture), make_progress_cb("uploading")
+                )
+            except (RuntimeError, OSError) as exc:
+                remote.ShutdownConnection()
+                return f"remote replay setup failed at step 'upload capture': {exc}"
             state.local_capture_path = str(local_capture)
         else:
             remote_path = state.capture
@@ -354,23 +607,39 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
                 remote.CopyCaptureFromRemote(
                     remote_path, str(local_tmp), make_progress_cb("downloading")
                 )
-            except Exception as exc:  # noqa: BLE001
+            except (RuntimeError, OSError) as exc:
                 shutil.rmtree(local_tmp.parent, ignore_errors=True)
                 remote.ShutdownConnection()
-                return f"CopyCaptureFromRemote failed: {exc}"
+                return f"remote replay setup failed at step 'download capture': {exc}"
             state.local_capture_path = str(local_tmp)
             state.local_capture_is_temp = True
 
+        step = "match gpu"
         remote_opts = rd.ReplayOptions()
         if state.local_capture_path:
-            tmp_cap = rd.OpenCaptureFile()
-            if tmp_cap.OpenFile(state.local_capture_path, "", None) == rd.ResultCode.Succeeded:
-                gpu = _match_capture_gpu(tmp_cap)
-                if gpu is not None:
-                    remote_opts.forceGPUVendor = gpu.vendor
-                    remote_opts.forceGPUDeviceID = gpu.deviceID
-                tmp_cap.Shutdown()
+            try:
+                tmp_cap = rd.OpenCaptureFile()
+                try:
+                    open_result = tmp_cap.OpenFile(state.local_capture_path, "", None)
+                    if open_result == rd.ResultCode.Succeeded:
+                        gpu = _match_capture_gpu(
+                            tmp_cap, tmp_cap.GetStructuredData(), rd, state.gpu_pref or None
+                        )
+                        if gpu is not None:
+                            remote_opts.forceGPUVendor = gpu.vendor
+                            remote_opts.forceGPUDeviceID = gpu.deviceID
+                            _log.info(
+                                "remote replay GPU: %s (vendor=%d id=%d)",
+                                gpu.name,
+                                gpu.vendor,
+                                gpu.deviceID,
+                            )
+                finally:
+                    tmp_cap.Shutdown()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("GPU probe skipped: %s: %s", type(exc).__name__, exc)
 
+        step = "open remote capture"
         result, controller = remote.OpenCapture(
             rd.RemoteServer.NoPreference,
             remote_path,
@@ -382,11 +651,13 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
             remote.ShutdownConnection()
             return f"remote OpenCapture failed: {result}"
 
+        step = "open local metadata"
         cap = rd.OpenCaptureFile()
         open_result = cap.OpenFile(state.local_capture_path, "", None)
         if open_result != rd.ResultCode.Succeeded:
             _cleanup_temp_capture(state)
             remote.CloseCapture(controller)
+            cap.Shutdown()
             remote.ShutdownConnection()
             return f"local OpenFile (metadata) failed: {open_result}"
 
@@ -396,13 +667,25 @@ def _load_remote_replay(state: DaemonState, remote_url: str) -> str | None:
         state.adapter = RenderDocAdapter(controller=controller, version=version)
         state.structured_file = state.adapter.get_structured_file()
 
+        step = "init adapter state"
         _init_adapter_state(state)
+        step = "start ping thread"
         _start_ping_thread(state)
     except Exception as exc:  # noqa: BLE001
         _stop_ping_thread(state)
+        if cap is not None:
+            try:
+                cap.Shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        if controller is not None:
+            try:
+                remote.CloseCapture(controller)
+            except Exception:  # noqa: BLE001
+                pass
         _cleanup_temp_capture(state)
         remote.ShutdownConnection()
-        return f"remote replay setup failed: {exc}"
+        return f"remote replay setup failed at step '{step}' ({type(exc).__name__}): {exc}"
     return None
 
 
@@ -455,9 +738,11 @@ def run_server(  # pragma: no cover
         server.settimeout(1.0)
 
         running = True
+        idle_exit = False
         last_activity = time.time()
         while running:
             if idle_timeout_s > 0 and time.time() - last_activity > idle_timeout_s:
+                idle_exit = True
                 break
 
             try:
@@ -512,6 +797,12 @@ def run_server(  # pragma: no cover
                     pass
                 last_activity = time.time()
 
+    # The shutdown RPC runs cleanup via _handle_shutdown before exiting the
+    # loop; an idle-timeout exit must release replay resources here so the
+    # remote replay session is not leaked on the remoteserver.
+    if idle_exit:
+        cleanup_state(state)
+
 
 def main() -> None:  # pragma: no cover
     _platform.install_shutdown_signal()
@@ -524,9 +815,12 @@ def main() -> None:  # pragma: no cover
     parser.add_argument("--idle-timeout", type=int, default=1800)
     parser.add_argument("--no-replay", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--remote-url", default=None)
+    parser.add_argument("--gpu", default=None)
     args = parser.parse_args()
 
-    state = DaemonState(capture=args.capture, current_eid=0, token=args.token)
+    state = DaemonState(
+        capture=args.capture, current_eid=0, token=args.token, gpu_pref=args.gpu or ""
+    )
 
     if not args.no_replay:
         if args.remote_url:

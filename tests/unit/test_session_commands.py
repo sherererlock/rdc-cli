@@ -59,7 +59,6 @@ def _session_file(home: Path) -> Path:
 
 
 def test_open_status_goto_close_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     monkeypatch.setattr("rdc.services.session_service._renderdoc_available", lambda: False)
     _mock_daemon(monkeypatch)
@@ -89,7 +88,6 @@ def test_open_status_goto_close_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 def test_goto_without_session_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     runner = CliRunner()
 
@@ -98,7 +96,6 @@ def test_goto_without_session_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 
 def test_close_without_session_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     runner = CliRunner()
 
@@ -107,7 +104,6 @@ def test_close_without_session_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 def test_goto_rejects_negative_eid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     monkeypatch.setattr("rdc.services.session_service._renderdoc_available", lambda: False)
     _mock_daemon(monkeypatch)
@@ -120,7 +116,6 @@ def test_goto_rejects_negative_eid(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 def test_status_shows_session_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """rdc status first line is 'session: <name>' matching active RDC_SESSION."""
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.setenv("RDC_SESSION", "mytest")
     monkeypatch.setattr("rdc.services.session_service._renderdoc_available", lambda: False)
     _mock_daemon(monkeypatch)
@@ -137,7 +132,6 @@ def test_status_shows_session_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 def test_status_shows_default_session_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Without --session, status first line is 'session: default'."""
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     monkeypatch.setattr("rdc.services.session_service._renderdoc_available", lambda: False)
     _mock_daemon(monkeypatch)
@@ -178,7 +172,6 @@ def test_require_session_cleans_stale_pid(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_open_no_replay_mode_warning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """B23: open command warns when renderdoc is unavailable."""
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: tmp_path / ".rdc")
     monkeypatch.delenv("RDC_SESSION", raising=False)
     monkeypatch.setattr("rdc.services.session_service._renderdoc_available", lambda: False)
     _mock_daemon(monkeypatch)
@@ -198,35 +191,53 @@ def test_open_no_replay_mode_warning(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 def _setup_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point data_dir to tmp_path/.rdc and return the path."""
-    data = tmp_path / ".rdc"
-    monkeypatch.setattr("rdc._platform.data_dir", lambda: data)
-    return data
+    """Return the isolated data dir path (isolation handled by the autouse fixture)."""
+    return tmp_path / ".rdc"
+
+
+def _forward(monkeypatch: pytest.MonkeyPatch, port: int | None) -> None:
+    """Stub adb-forward lookup to return *port* (or None)."""
+    monkeypatch.setattr("rdc.commands.session._adb_forwarded_port", lambda serial: port)
 
 
 def test_resolve_android_url_with_serial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
+    _forward(monkeypatch, 27015)
     save_remote_state(RemoteServerState(host="adb://DEV1", port=0, connected_at=1000.0))
 
     result = _resolve_android_url(serial="DEV1")
-    assert result == "adb://DEV1"
+    assert result == "localhost:27015"
 
 
 def test_resolve_android_url_no_serial_uses_latest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
+    _forward(monkeypatch, 27016)
     save_remote_state(RemoteServerState(host="adb://OLD", port=0, connected_at=500.0))
     save_remote_state(RemoteServerState(host="adb://NEW", port=0, connected_at=2000.0))
 
     result = _resolve_android_url(serial=None)
-    assert result == "adb://NEW"
+    assert result == "localhost:27016"
+
+
+def test_resolve_android_url_no_forward_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No adb forward -> clean UsageError, never a crash-prone adb:// URL."""
+    _setup_data_dir(monkeypatch, tmp_path)
+    _forward(monkeypatch, None)
+    save_remote_state(RemoteServerState(host="adb://DEV1", port=0, connected_at=1000.0))
+
+    with pytest.raises(click.UsageError, match="adb forward not found for DEV1"):
+        _resolve_android_url(serial="DEV1")
 
 
 def test_resolve_android_url_serial_not_found(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
+    _forward(monkeypatch, 27017)
     save_remote_state(RemoteServerState(host="adb://AAA", port=0, connected_at=1000.0))
 
     with pytest.raises(click.UsageError, match="ZZZ"):
@@ -245,11 +256,12 @@ def test_resolve_android_url_ignores_non_adb(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
+    _forward(monkeypatch, 27018)
     save_remote_state(RemoteServerState(host="192.168.1.10", port=8888, connected_at=9999.0))
     save_remote_state(RemoteServerState(host="adb://ABC123", port=0, connected_at=1000.0))
 
     result = _resolve_android_url(serial=None)
-    assert result == "adb://ABC123"
+    assert result == "localhost:27018"
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +306,7 @@ def _mock_daemon_capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 def test_open_android_resolves_adb_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
     monkeypatch.delenv("RDC_SESSION", raising=False)
+    _forward(monkeypatch, 27015)
     save_remote_state(RemoteServerState(host="adb://ABC123", port=0, connected_at=1000.0))
     recorded = _mock_daemon_capture(monkeypatch)
     capture_file = tmp_path / "capture.rdc"
@@ -302,12 +315,39 @@ def test_open_android_resolves_adb_url(monkeypatch: pytest.MonkeyPatch, tmp_path
     result = CliRunner().invoke(main, ["open", str(capture_file), "--android"])
     assert result.exit_code == 0, result.output + (result.stderr or "")
     assert len(recorded["calls"]) == 1
-    assert recorded["calls"][0]["kwargs"]["remote_url"] == "adb://ABC123"
+    assert recorded["calls"][0]["kwargs"]["remote_url"] == "localhost:27015"
+
+
+def test_open_gpu_passed_to_daemon(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _setup_data_dir(monkeypatch, tmp_path)
+    monkeypatch.delenv("RDC_SESSION", raising=False)
+    recorded = _mock_daemon_capture(monkeypatch)
+    capture_file = tmp_path / "capture.rdc"
+    capture_file.touch()
+
+    result = CliRunner().invoke(main, ["open", str(capture_file), "--gpu", "1"])
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    assert recorded["calls"][0]["kwargs"]["gpu"] == "1"
+
+
+def test_open_gpu_ignored_with_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _setup_data_dir(monkeypatch, tmp_path)
+    monkeypatch.delenv("RDC_SESSION", raising=False)
+    monkeypatch.setattr(
+        "rdc.commands.session.connect_session", lambda *a, **kw: (True, "connected")
+    )
+
+    result = CliRunner().invoke(
+        main, ["open", "--connect", "host:1234", "--token", "tok", "--gpu", "1"]
+    )
+    assert result.exit_code == 0, result.output + (result.stderr or "")
+    assert "--gpu is ignored with --connect" in (result.stderr or "") + result.output
 
 
 def test_open_android_with_serial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _setup_data_dir(monkeypatch, tmp_path)
     monkeypatch.delenv("RDC_SESSION", raising=False)
+    _forward(monkeypatch, 27019)
     save_remote_state(RemoteServerState(host="adb://AAA", port=0, connected_at=2000.0))
     save_remote_state(RemoteServerState(host="adb://BBB", port=0, connected_at=1000.0))
     recorded = _mock_daemon_capture(monkeypatch)
@@ -316,7 +356,7 @@ def test_open_android_with_serial(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     result = CliRunner().invoke(main, ["open", str(capture_file), "--android", "--serial", "BBB"])
     assert result.exit_code == 0, result.output + (result.stderr or "")
-    assert recorded["calls"][0]["kwargs"]["remote_url"] == "adb://BBB"
+    assert recorded["calls"][0]["kwargs"]["remote_url"] == "localhost:27019"
 
 
 def test_open_android_no_state_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

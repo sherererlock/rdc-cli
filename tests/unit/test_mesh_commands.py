@@ -68,6 +68,21 @@ class TestMeshCmd:
         assert not any(ln.startswith("#") for ln in lines)
         assert lines[0].startswith("v ")
 
+    def test_mesh_obj_warns_on_position_warning(self, monkeypatch: Any) -> None:
+        warning = (
+            "heuristic position selection chose 'ATTRIBUTE0' from 2 candidates; "
+            "use a position override if this is wrong"
+        )
+        monkeypatch.setattr(
+            "rdc.commands.mesh.call",
+            lambda m, p: {**_MESH_RESPONSE, "position_warning": warning},
+        )
+        runner = CliRunner()
+        result = runner.invoke(mesh_cmd, [])
+        assert result.exit_code == 0
+        assert f"mesh: warning: {warning}" in result.output
+        assert "v 0.000000 0.500000 0.000000" in result.output
+
     def test_mesh_stage_forwarded(self, monkeypatch: Any) -> None:
         calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -81,12 +96,77 @@ class TestMeshCmd:
         assert result.exit_code == 0
         assert calls[0][1]["stage"] == "gs-out"
 
+    def test_mesh_stage_vs_in_forwarded(self, monkeypatch: Any) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            return _MESH_RESPONSE
+
+        monkeypatch.setattr("rdc.commands.mesh.call", mock_call)
+        runner = CliRunner()
+        result = runner.invoke(mesh_cmd, ["--stage", "vs-in"])
+        assert result.exit_code == 0
+        assert calls[0][1]["stage"] == "vs-in"
+
+    def test_mesh_position_attribute_forwarded(self, monkeypatch: Any) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            return _MESH_RESPONSE
+
+        monkeypatch.setattr("rdc.commands.mesh.call", mock_call)
+        runner = CliRunner()
+        result = runner.invoke(mesh_cmd, ["--stage", "vs-in", "--position-attribute", "TEXCOORD"])
+        assert result.exit_code == 0
+        assert calls[0][1]["position_attribute"] == "TEXCOORD"
+
+    def test_mesh_position_index_forwarded(self, monkeypatch: Any) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            return _MESH_RESPONSE
+
+        monkeypatch.setattr("rdc.commands.mesh.call", mock_call)
+        runner = CliRunner()
+        result = runner.invoke(mesh_cmd, ["--stage", "vs-in", "--position-index", "1"])
+        assert result.exit_code == 0
+        assert calls[0][1]["position_index"] == 1
+
+    def test_mesh_position_slot_offset_forwarded(self, monkeypatch: Any) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            return _MESH_RESPONSE
+
+        monkeypatch.setattr("rdc.commands.mesh.call", mock_call)
+        runner = CliRunner()
+        result = runner.invoke(
+            mesh_cmd,
+            ["--stage", "vs-in", "--position-slot", "0", "--position-offset", "12"],
+        )
+        assert result.exit_code == 0
+        assert calls[0][1]["position_slot"] == 0
+        assert calls[0][1]["position_offset"] == 12
+
+    def test_mesh_unknown_stage_rejected(self, monkeypatch: Any) -> None:
+        called: list[Any] = []
+        monkeypatch.setattr("rdc.commands.mesh.call", lambda m, p: called.append((m, p)))
+        runner = CliRunner()
+        result = runner.invoke(mesh_cmd, ["--stage", "bad-stage"])
+        assert result.exit_code == 2
+        assert not called
+
     def test_mesh_help(self) -> None:
         runner = CliRunner()
         result = runner.invoke(mesh_cmd, ["--help"])
         assert result.exit_code == 0
         assert "EID" in result.output
         assert "--stage" in result.output
+        assert "--position-attribute" in result.output
         assert "-o" in result.output
 
     def test_mesh_in_main_help(self) -> None:
@@ -147,3 +227,57 @@ class TestObjFormatter:
         assert len(faces) == 2
         assert faces[0] == [0, 1, 2]
         assert faces[1] == [0, 2, 3]
+
+
+class TestNonTriangleTopologyWarning:
+    """Non-triangle topology must warn rather than silently drop faces."""
+
+    def _resp(self, topology: str) -> dict[str, Any]:
+        return {
+            "eid": 7,
+            "stage": "vs-in",
+            "topology": topology,
+            "vertex_count": 4,
+            "comp_count": 3,
+            "stride": 12,
+            "vertices": [[0.0, 0.0, 0.0]] * 4,
+            "index_count": 0,
+            "indices": [],
+        }
+
+    def test_patch_list_warns_and_exits_zero(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr("rdc.commands.mesh.call", lambda m, p: self._resp("PatchList_3"))
+        result = CliRunner().invoke(mesh_cmd, [])
+        assert result.exit_code == 0
+        assert "PatchList_3" in result.output
+        assert "no OBJ face mapping" in result.output
+        assert "4 vertices" in result.output
+        assert "0 faces" in result.output
+        v_lines = [ln for ln in result.output.split("\n") if ln.startswith("v ")]
+        f_lines = [ln for ln in result.output.split("\n") if ln.startswith("f ")]
+        assert len(v_lines) == 4
+        assert len(f_lines) == 0
+
+    def test_triangle_list_no_warning(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            "rdc.commands.mesh.call",
+            lambda m, p: {
+                **self._resp("TriangleList"),
+                "vertex_count": 3,
+                "vertices": [[0.0, 0.0, 0.0]] * 3,
+            },
+        )
+        result = CliRunner().invoke(mesh_cmd, [])
+        assert result.exit_code == 0
+        assert "no OBJ face mapping" not in result.output
+
+    def test_json_path_warns_on_non_triangle(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr("rdc.commands.mesh.call", lambda m, p: self._resp("LineList"))
+        result = CliRunner().invoke(mesh_cmd, ["--json"])
+        assert result.exit_code == 0
+        assert "LineList" in result.output
+        assert "no OBJ face mapping" in result.output
+        data = json.loads(
+            "\n".join(ln for ln in result.output.split("\n") if not ln.startswith("mesh:"))
+        )
+        assert data["face_count"] == 0

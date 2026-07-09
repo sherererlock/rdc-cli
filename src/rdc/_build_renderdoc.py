@@ -295,6 +295,10 @@ def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
             sys.stderr.write(f"ERROR: zip-slip attempt detected: {member.filename}\n")
             raise SystemExit(1)
         zf.extract(member, dest)
+        # Restore Unix execute bits that zipfile.extract() drops.
+        unix_mode = member.external_attr >> 16
+        if unix_mode and (unix_mode & 0o111):
+            target.chmod(target.stat().st_mode | (unix_mode & 0o111))
 
 
 def download_swig(build_dir: Path) -> None:
@@ -377,6 +381,13 @@ def configure_build(
     cmd += CMAKE_COMMON_FLAGS
     cmd.append(f"-DRENDERDOC_SWIG_PACKAGE={swig_dir}")
 
+    # Use base_prefix Python so cmake finds python3.XX-config (venv lacks it)
+    base_python = Path(sys.base_prefix) / "bin" / Path(sys.executable).name
+    if base_python.exists():
+        cmd.append(f"-DPython3_EXECUTABLE={base_python}")
+    else:
+        _log(f"WARNING: base Python not found at {base_python}, cmake will auto-detect")
+
     env = dict(os.environ)
     if plat == "linux":
         _log("stripping LTO flags")
@@ -429,8 +440,19 @@ def copy_artifacts(build_dir: Path, install_dir: Path, plat: str) -> None:
     _log(f"artifacts copied to {install_dir}")
 
 
-def _install_vulkan_layer(install_dir: Path, build_dir: Path) -> None:
-    """Copy Vulkan layer JSON and register as implicit layer on Windows."""
+def _parse_version(version: str) -> tuple[int, int]:
+    """Parse a RenderDoc tag like ``v1.41`` into ``(major, minor)``."""
+    parts = version.lstrip("v").split(".")
+    return int(parts[0]), int(parts[1])
+
+
+def _install_vulkan_layer(install_dir: Path, build_dir: Path, version: str = RDOC_TAG) -> None:
+    """Copy Vulkan layer JSON and register as implicit layer on Windows.
+
+    Upstream substitutes ``renderdoc.json`` via CMake ``configure_file``, but that block is
+    UNIX-only, so on Windows the template ships with unsubstituted ``@...@`` placeholders.
+    Resolve every templated field here so the layer can self-enable.
+    """
     src_dir = build_dir / "renderdoc"
 
     # Find layer JSON from build output
@@ -448,10 +470,23 @@ def _install_vulkan_layer(install_dir: Path, build_dir: Path) -> None:
 
     import json
 
+    major, minor = _parse_version(version)
     data = json.loads(layer_src.read_text(encoding="utf-8"))
-    data["layer"]["library_path"] = ".\\renderdoc.dll"
+    layer = data["layer"]
+    layer["name"] = "VK_LAYER_RENDERDOC_Capture"
+    layer["library_path"] = ".\\renderdoc.dll"
+    layer["implementation_version"] = str(minor)
+    layer["enable_environment"] = {"ENABLE_VULKAN_RENDERDOC_CAPTURE": "1"}
+    layer["disable_environment"] = {f"DISABLE_VULKAN_RENDERDOC_CAPTURE_{major}_{minor}": "1"}
+
+    serialized = json.dumps(data, indent=2)
+    if "@" in serialized:
+        raise RuntimeError(
+            f"Vulkan layer manifest still contains unsubstituted template vars: {serialized}"
+        )
+
     layer_dst = install_dir / "renderdoc.json"
-    layer_dst.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    layer_dst.write_text(serialized, encoding="utf-8")
     _log(f"Vulkan layer JSON installed to {layer_dst}")
 
     # Register in Windows registry
@@ -749,8 +784,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     plat = _platform()
-    install_dir = Path(args.install_dir) if args.install_dir else default_install_dir()
-    build_dir = Path(args.build_dir) if args.build_dir else install_dir.parent / "renderdoc-build"
+    install_dir = Path(args.install_dir).resolve() if args.install_dir else default_install_dir()
+    build_dir = (
+        Path(args.build_dir).resolve() if args.build_dir else install_dir.parent / "renderdoc-build"
+    )
 
     if _artifacts_present(install_dir, plat):
         _log(f"renderdoc already exists at {install_dir}/")
@@ -776,7 +813,7 @@ def main(argv: list[str] | None = None) -> None:
     copy_artifacts(build_dir, install_dir, plat)
 
     if plat == "windows":
-        _install_vulkan_layer(install_dir, build_dir)
+        _install_vulkan_layer(install_dir, build_dir, args.version)
 
     _log("=== Done ===")
     _log(f'  export RENDERDOC_PYTHON_PATH="{install_dir}"')

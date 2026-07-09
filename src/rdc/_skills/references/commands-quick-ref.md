@@ -162,8 +162,8 @@ Show bound resources per shader stage.
 |------|------|------|---------|
 | `--binding` | Filter by binding index. | integer |  |
 | `--set` | Filter by descriptor set index. | integer |  |
-| `--json` | Output JSON. | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -282,6 +282,27 @@ Output VFS leaf node content.
 | `--raw` | Force raw output even on TTY | flag |  |
 | `-o, --output` | Write binary output to file | path |  |
 
+## `rdc cbuffer`
+
+Decode a constant buffer to JSON or export its raw bytes.
+
+**Arguments:**
+
+| Name | Type | Required |
+|------|------|----------|
+| `eid` | integer | no |
+
+**Options:**
+
+| Flag | Help | Type | Default |
+|------|------|------|---------|
+| `--stage` | Shader stage (default: ps) | choice | ps |
+| `--set` | Vulkan: descriptor set. D3D12: register space. | integer | 0 |
+| `--binding` | Vulkan: binding. D3D12: shader register (bN). | integer | 0 |
+| `--json` | JSON output (default) | flag |  |
+| `--raw` | Export raw constant-buffer bytes | flag |  |
+| `-o, --output` | Write raw bytes to file | path |  |
+
 ## `rdc close`
 
 Close daemon-backed session.
@@ -329,8 +350,8 @@ Query GPU performance counters.
 | `--list` | List available counters. | flag |  |
 | `--eid` | Filter to specific event ID. | integer |  |
 | `--name` | Filter counters by name substring. | text |  |
-| `--json` | JSON output. | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -403,6 +424,28 @@ Debug vertex shader for vertex VTX_ID at event EID.
 | `--json` | JSON output | flag |  |
 | `--no-header` | Suppress TSV header row | flag |  |
 
+## `rdc descriptors`
+
+Show the descriptors a draw actually used, resolved to resources.
+
+**Arguments:**
+
+| Name | Type | Required |
+|------|------|----------|
+| `eid` | integer | no |
+
+**Options:**
+
+| Flag | Help | Type | Default |
+|------|------|------|---------|
+| `--stage` | Filter by shader stage. | choice |  |
+| `--type` | Filter by descriptor type (case-insensitive). | text |  |
+| `--binding` | Filter by binding name or number. | text |  |
+| `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
+| `--jsonl` | JSONL output | flag |  |
+| `-q, --quiet` | Print primary key column only | flag |  |
+
 ## `rdc diff`
 
 Compare two RenderDoc captures side-by-side.
@@ -469,7 +512,7 @@ List draw calls.
 | `--no-header` | Omit TSV header | flag |  |
 | `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
-| `-q, --quiet` | Only EID column | flag |  |
+| `-q, --quiet` | Print primary key column only | flag |  |
 
 ## `rdc event`
 
@@ -502,7 +545,7 @@ List all events.
 | `--no-header` | Omit TSV header | flag |  |
 | `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
-| `-q, --quiet` | Only EID column | flag |  |
+| `-q, --quiet` | Print primary key column only | flag |  |
 
 ## `rdc goto`
 
@@ -555,8 +598,8 @@ Show debug/validation messages from the capture.
 |------|------|------|---------|
 | `--level` | Filter by severity. | choice |  |
 | `--eid` | Filter by event ID. | integer |  |
-| `--json` | JSON output | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -599,6 +642,10 @@ Export post-transform mesh as OBJ.
 | `-o, --output` | Write to file | path |  |
 | `--json` | JSON output | flag |  |
 | `--no-header` | Suppress OBJ header comment | flag |  |
+| `--position-attribute` | VS-IN position input name/semantic | text |  |
+| `--position-index` | VS-IN position input list index | integer |  |
+| `--position-slot` | VS-IN position vertex buffer slot | integer |  |
+| `--position-offset` | VS-IN position byte offset | integer |  |
 
 ## `rdc open`
 
@@ -623,6 +670,7 @@ Create local default session and start daemon skeleton.
 | `--connect` | Connect to an already-running external daemon. | text |  |
 | `--token` | Authentication token (required with --connect). | text |  |
 | `--timeout` | Daemon startup timeout in seconds. | float |  |
+| `--gpu` | Force the replay GPU by 0-based index, name substring, or device ID (overrides auto-selection). | text |  |
 
 ## `rdc pass`
 
@@ -648,12 +696,12 @@ List render passes.
 
 | Flag | Help | Type | Default |
 |------|------|------|---------|
-| `--json` | Output JSON. | flag |  |
 | `--deps` | Show pass dependency DAG. | flag |  |
 | `--dot` | Graphviz DOT output (requires --deps). | flag |  |
 | `--graph` | Human-readable graph (requires --deps). | flag |  |
 | `--table` | Per-pass I/O table (requires --deps). | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -711,8 +759,8 @@ Query pixel history at (X, Y) for the current or specified event.
 |------|------|------|---------|
 | `--target` | Color target index (default 0) | integer | 0 |
 | `--sample` | MSAA sample index (default 0) | integer | 0 |
-| `--json` | JSON output | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -832,11 +880,11 @@ List all resources.
 
 | Flag | Help | Type | Default |
 |------|------|------|---------|
-| `--json` | Output JSON. | flag |  |
 | `--type` | Filter by resource type (exact, case-insensitive). | text |  |
 | `--name` | Filter by name substring (case-insensitive). | text |  |
 | `--sort` | Sort order. | choice | id |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -855,7 +903,8 @@ Export render target as PNG.
 | Flag | Help | Type | Default |
 |------|------|------|---------|
 | `-o, --output` | Write to file | path |  |
-| `--target` | Color target index (default 0) | integer | 0 |
+| `--target` | Color target index (default 0); mutually exclusive with --depth | integer |  |
+| `--depth` | Export the raw depth attachment texture (/draws/<eid>/targets/depth.png); distinct from --overlay depth, which renders RenderDoc's depth overlay visualization. Ignored when --overlay is set. | flag |  |
 | `--raw` | Force raw output even on TTY | flag |  |
 | `--overlay` | Render with debug overlay | choice |  |
 | `--width` | Overlay render width | integer | 256 |
@@ -1022,10 +1071,10 @@ Output EID-to-shader mapping as TSV.
 
 | Flag | Help | Type | Default |
 |------|------|------|---------|
-| `--no-header` | Omit TSV header row. | flag |  |
-| `--json` | JSON output. | flag |  |
-| `--jsonl` | JSONL output. | flag |  |
-| `-q, --quiet` | Print EID column only. | flag |  |
+| `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
+| `--jsonl` | JSONL output | flag |  |
+| `-q, --quiet` | Print primary key column only | flag |  |
 
 ## `rdc shader-replace`
 
@@ -1082,8 +1131,8 @@ List unique shaders in capture.
 |------|------|------|---------|
 | `--stage` | Filter by shader stage. | choice |  |
 | `--sort` | Sort order. | choice | name |
-| `--json` | Output JSON. | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -1112,8 +1161,8 @@ Show per-pass breakdown, top draws, largest resources.
 
 | Flag | Help | Type | Default |
 |------|------|------|---------|
-| `--json` | JSON output | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |
 
@@ -1217,7 +1266,7 @@ Show resource usage (which events read/write a resource).
 | `--all` | Show all resources usage matrix. | flag |  |
 | `--type` | Filter by resource type. | text |  |
 | `--usage` | Filter by usage type. | text |  |
-| `--json` | JSON output. | flag |  |
 | `--no-header` | Omit TSV header | flag |  |
+| `--json` | JSON output | flag |  |
 | `--jsonl` | JSONL output | flag |  |
 | `-q, --quiet` | Print primary key column only | flag |  |

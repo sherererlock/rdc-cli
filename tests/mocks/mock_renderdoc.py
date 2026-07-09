@@ -320,6 +320,20 @@ class CompType(IntEnum):
     UNormSRGB = 9
 
 
+class ResourceFormatType(IntEnum):
+    Regular = 0
+    BC1 = 2
+    R10G10B10A2 = 12
+    R11G11B10 = 13
+    R5G6B5 = 14
+    R9G9B9E5 = 16
+    D16S8 = 19
+    D24S8 = 20
+    D32S8 = 21
+    S8 = 22
+    A8 = 28
+
+
 class MeshDataStage(IntEnum):
     VSIn = 0
     VSOut = 1
@@ -399,6 +413,26 @@ class SectionFlags(IntFlag):
     ASCIIStored = 1
     LZ4Compressed = 2
     ZstdCompressed = 4
+
+
+class EnvMod(IntEnum):
+    Set = 0
+    Add = 1
+
+
+class EnvSep(IntEnum):
+    Platform = 0
+    SemiColon = 1
+    Colon = 2
+    NoSep = 3
+
+
+@dataclass
+class EnvironmentModification:
+    name: str = ""
+    value: str = ""
+    mod: EnvMod = EnvMod.Set
+    sep: EnvSep = EnvSep.NoSep
 
 
 @dataclass
@@ -616,6 +650,7 @@ class ActionDescription:
     numIndices: int = 0
     numInstances: int = 1
     indexOffset: int = 0
+    vertexOffset: int = 0
     baseVertex: int = 0
     instanceOffset: int = 0
     children: list[ActionDescription] = field(default_factory=list)
@@ -965,11 +1000,19 @@ class MeshFormat:
 
 @dataclass
 class ShaderValue:
-    """Mock for ShaderValue union (real API has f32v, u32v, s32v, f64v)."""
+    """Mock for ShaderValue union lanes used by RenderDoc."""
 
+    f16v: list[float] = field(default_factory=lambda: [0.0] * 16)
     f32v: list[float] = field(default_factory=lambda: [0.0] * 16)
+    f64v: list[float] = field(default_factory=lambda: [0.0] * 16)
+    u8v: list[int] = field(default_factory=lambda: [0] * 16)
+    s8v: list[int] = field(default_factory=lambda: [0] * 16)
+    u16v: list[int] = field(default_factory=lambda: [0] * 16)
+    s16v: list[int] = field(default_factory=lambda: [0] * 16)
     u32v: list[int] = field(default_factory=lambda: [0] * 16)
     s32v: list[int] = field(default_factory=lambda: [0] * 16)
+    u64v: list[int] = field(default_factory=lambda: [0] * 16)
+    s64v: list[int] = field(default_factory=lambda: [0] * 16)
 
 
 @dataclass
@@ -1497,8 +1540,22 @@ class MockReplayController:
         """Mock GetCBufferVariableContents."""
         return self._cbuffer_variables.get((int(stage), idx), [])
 
+    def set_mesh_data(self, stage: Any, mesh: MeshFormat) -> None:
+        """Configure the MeshFormat returned for a given mesh data stage.
+
+        Args:
+            stage: A ``MeshDataStage`` value (or its int), e.g. ``0`` for VSIn.
+            mesh: The ``MeshFormat`` to return for that stage.
+        """
+        self._mesh_data[int(stage)] = mesh
+
     def GetPostVSData(self, instance: int, view: int, stage: Any) -> MeshFormat:
-        """Mock GetPostVSData -- returns configured or empty mesh format."""
+        """Mock GetPostVSData -- returns configured or empty mesh format.
+
+        Unconfigured stages (including VSIn at stage int ``0`` for non-draw
+        events) yield a default ``MeshFormat`` with zero ``vertexResourceId``
+        and ``vertexByteStride``, exercising the daemon's ``-32001`` path.
+        """
         return self._mesh_data.get(int(stage), MeshFormat())
 
     def GetDisassemblyTargets(self, with_pipeline: bool) -> list[str]:

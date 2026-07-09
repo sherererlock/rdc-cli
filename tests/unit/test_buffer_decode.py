@@ -16,7 +16,9 @@ from mock_renderdoc import (
     BoundVBuffer,
     ConstantBlock,
     Descriptor,
+    MeshFormat,
     MockPipeState,
+    MockReplayController,
     ResourceDescription,
     ResourceFormat,
     ResourceId,
@@ -89,6 +91,8 @@ def state(tmp_path: Path) -> DaemonState:
     # Set up cbuffer descriptor for GetConstantBlock
     pipe._cbuffer_descriptors[(ShaderStage.Pixel, 0)] = Descriptor(
         resource=ResourceId(50),
+        byteOffset=0,
+        byteSize=16,
     )
 
     # Vertex inputs for vbuffer test
@@ -131,6 +135,7 @@ def state(tmp_path: Path) -> DaemonState:
 
     vbuf_data = _make_vbuffer_data()
     ibuf_data = _make_ibuffer_data_u16()
+    cbuf_data = bytes(range(16))
     light_val = ShaderValue(f32v=[0.5, 0.7, 0.0] + [0.0] * 13)
     intensity_val = ShaderValue(f32v=[1.0] + [0.0] * 15)
     cbuffer_vars = [
@@ -163,6 +168,8 @@ def state(tmp_path: Path) -> DaemonState:
             return vbuf_data
         if rid == 43:
             return ibuf_data
+        if rid == 50:
+            return cbuf_data[offset : offset + length] if length > 0 else cbuf_data[offset:]
         return b""
 
     controller = SimpleNamespace(
@@ -233,6 +240,18 @@ class TestCbufferDecode:
         )
         assert resp["error"]["code"] == -32001
 
+    def test_invalid_stage_rejected(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode",
+                {"eid": 10, "set": 0, "binding": 0, "stage": "../ps"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32602
+        assert "invalid stage" in resp["error"]["message"]
+
     def test_invalid_binding(self, state: DaemonState) -> None:
         resp, _ = _handle_request(
             rpc_request(
@@ -279,6 +298,378 @@ class TestCbufferDecode:
         r = resp["result"]
         assert r["variables"][0]["name"] == "light.dir"
         assert r["variables"][1]["name"] == "light.color"
+
+    def test_uint_numeric_type_extracts_u32v(self, state: DaemonState) -> None:
+        """RenderDoc may expose uint cbuffer variables as numeric type 4."""
+        uint_val = ShaderValue(f32v=[0.0] * 16, u32v=[13, 17, 19, 23] + [0] * 12)
+        state.adapter.controller.GetCBufferVariableContents = lambda *args: [
+            ShaderVariable(
+                name="tileCounts",
+                type=4,
+                rows=1,
+                columns=4,
+                value=uint_val,
+            )
+        ]
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["variables"][0]["type"] == "4"
+        assert r["variables"][0]["value"] == [13, 17, 19, 23]
+
+    def test_uint_missing_lane_uses_int_fallback(self, state: DaemonState) -> None:
+        """Missing integer lanes return integer zeros, not raw value objects."""
+        state.adapter.controller.GetCBufferVariableContents = lambda *args: [
+            ShaderVariable(
+                name="missingUint",
+                type=4,
+                rows=1,
+                columns=2,
+                value=SimpleNamespace(),
+            )
+        ]
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        value = resp["result"]["variables"][0]["value"]
+        assert value == [0, 0]
+        assert all(type(item) is int for item in value)
+
+    def test_64_bit_integer_numeric_types_use_64_bit_lanes(self, state: DaemonState) -> None:
+        """RenderDoc exposes signed/unsigned 64-bit ints as numeric types 7 and 8."""
+        state.adapter.controller.GetCBufferVariableContents = lambda *args: [
+            ShaderVariable(
+                name="signedLong",
+                type=7,
+                rows=1,
+                columns=1,
+                value=ShaderValue(s64v=[-9_000_000_000] + [0] * 15),
+            ),
+            ShaderVariable(
+                name="unsignedLong",
+                type=8,
+                rows=1,
+                columns=1,
+                value=ShaderValue(u64v=[18_000_000_000] + [0] * 15),
+            ),
+        ]
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        variables = resp["result"]["variables"]
+        assert variables[0]["value"] == -9_000_000_000
+        assert variables[1]["value"] == 18_000_000_000
+
+    @pytest.mark.parametrize(
+        ("var_type", "lane_name"),
+        [
+            (9, "s8v"),
+            (10, "u8v"),
+            ("sbyte", "s8v"),
+            ("ubyte", "u8v"),
+        ],
+    )
+    def test_byte_integer_types_use_byte_lanes(self, var_type: object, lane_name: str) -> None:
+        """Byte-sized reflected variables map to byte ShaderValue lanes."""
+        from rdc.handlers._helpers import _shader_value_lane_name
+
+        assert _shader_value_lane_name(var_type) == lane_name
+
+    def test_double_numeric_type_extracts_f64v(self, state: DaemonState) -> None:
+        """RenderDoc exposes double cbuffer variables as numeric type 1."""
+        double_val = ShaderValue(f32v=[0.0] * 16, f64v=[1.25, 2.5] + [0.0] * 14)
+        state.adapter.controller.GetCBufferVariableContents = lambda *args: [
+            ShaderVariable(
+                name="clipRange",
+                type=1,
+                rows=1,
+                columns=2,
+                value=double_val,
+            )
+        ]
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["variables"][0]["type"] == "1"
+        assert r["variables"][0]["value"] == [1.25, 2.5]
+
+    def test_double_named_type_extracts_f64v(self, state: DaemonState) -> None:
+        """Mocks and adapters may expose reflected double types by name."""
+        double_val = ShaderValue(f32v=[0.0] * 16, f64v=[3.5] + [0.0] * 15)
+        state.adapter.controller.GetCBufferVariableContents = lambda *args: [
+            ShaderVariable(
+                name="exposure",
+                type="double",
+                rows=1,
+                columns=1,
+                value=double_val,
+            )
+        ]
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_decode", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["variables"][0]["type"] == "double"
+        assert r["variables"][0]["value"] == 3.5
+
+
+class TestCbufferRaw:
+    def test_stageful_raw_data_node_visible_to_vfs_ls(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "vfs_ls",
+                {"path": "/draws/10/cbuffer/ps/0/0/data"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["path"] == "/draws/10/cbuffer/ps/0/0/data"
+        assert r["kind"] == "leaf_bin"
+
+    def test_happy_path(self, state: DaemonState, tmp_path: Path) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["size"] == 16
+        out = Path(r["path"])
+        assert out.exists()
+        assert out.read_bytes() == bytes(range(16))
+        assert out == tmp_path / "cbuffer_10_ps_0_0.bin"
+
+    def test_stage_specific_resources_with_same_set_binding(
+        self, state: DaemonState, tmp_path: Path
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._shaders[ShaderStage.Vertex] = ResourceId(101)
+        pipe._reflections[ShaderStage.Vertex] = ShaderReflection(
+            constantBlocks=[
+                ConstantBlock(
+                    name="VsParams",
+                    byteSize=4,
+                    fixedBindSetOrSpace=0,
+                    fixedBindNumber=0,
+                ),
+            ],
+        )
+        pipe._cbuffer_descriptors[(ShaderStage.Vertex, 0)] = Descriptor(
+            resource=ResourceId(51),
+            byteOffset=0,
+            byteSize=4,
+        )
+        pipe._cbuffer_descriptors[(ShaderStage.Pixel, 0)] = Descriptor(
+            resource=ResourceId(50),
+            byteOffset=0,
+            byteSize=4,
+        )
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            if int(rid) == 51:
+                return b"VS!!"[offset : offset + length]
+            if int(rid) == 50:
+                return b"PS!!"[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+
+        vs_resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw",
+                {"eid": 10, "stage": "vs", "set": 0, "binding": 0},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        ps_resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw",
+                {"eid": 10, "stage": "ps", "set": 0, "binding": 0},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        vs_path = Path(vs_resp["result"]["path"])
+        ps_path = Path(ps_resp["result"]["path"])
+        assert vs_path.read_bytes() == b"VS!!"
+        assert ps_path.read_bytes() == b"PS!!"
+        assert vs_path == tmp_path / "cbuffer_10_vs_0_0.bin"
+        assert ps_path == tmp_path / "cbuffer_10_ps_0_0.bin"
+
+    def test_not_buffer_backed(self, state: DaemonState, tmp_path: Path) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._reflections[ShaderStage.Pixel].constantBlocks[0].bufferBacked = False
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert "error" in resp
+        assert "not buffer-backed" in resp["error"]["message"].lower()
+        assert not (tmp_path / "cbuffer_10_ps_0_0.bin").exists()
+
+    def test_no_adapter(self) -> None:
+        s = DaemonState(
+            capture="t.rdc",
+            current_eid=0,
+            token="abcdef1234567890",
+        )
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            s,
+        )
+        assert resp["error"]["code"] == -32002
+
+    def test_invalid_binding(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 99}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+
+    def test_no_reflection(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw",
+                {"eid": 10, "set": 0, "binding": 0, "stage": "vs"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+
+    def test_invalid_stage_rejected_before_temp_filename(
+        self, state: DaemonState, tmp_path: Path
+    ) -> None:
+        def _fail_get(*args: Any) -> bytes:
+            pytest.fail("invalid stage should not read buffer data")
+
+        state.adapter.controller.GetBufferData = _fail_get
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw",
+                {"eid": 10, "set": 0, "binding": 0, "stage": "../ps"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32602
+        assert "invalid stage" in resp["error"]["message"]
+        assert list(tmp_path.iterdir()) == []
+
+    def test_constant_block_unavailable(self, state: DaemonState, monkeypatch: Any) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        monkeypatch.delattr(type(pipe), "GetConstantBlock")
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert "error" in resp
+        assert "unavailable" in resp["error"]["message"].lower()
+
+    def test_no_temp_dir(self, state: DaemonState) -> None:
+        state.temp_dir = None
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32002
+
+    def test_null_resource_not_bound(self, state: DaemonState, tmp_path: Path) -> None:
+        """Null/zero cbuffer resource → clean -32001 error, no temp file."""
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._cbuffer_descriptors[(ShaderStage.Pixel, 0)] = Descriptor(
+            resource=ResourceId(0),
+            byteOffset=0,
+            byteSize=16,
+        )
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert "not bound" in resp["error"]["message"].lower()
+        assert not (tmp_path / "cbuffer_10_ps_0_0.bin").exists()
+
+    def test_zero_byte_size_falls_back_to_reflected(
+        self, state: DaemonState, tmp_path: Path
+    ) -> None:
+        """byteSize==0 falls back to reflected block size; GetBufferData never gets size 0."""
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._cbuffer_descriptors[(ShaderStage.Pixel, 0)] = Descriptor(
+            resource=ResourceId(50),
+            byteOffset=0,
+            byteSize=0,
+        )
+        pipe._reflections[ShaderStage.Pixel].constantBlocks[0].byteSize = 12
+        orig_get = state.adapter.controller.GetBufferData
+        seen_sizes: list[int] = []
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            seen_sizes.append(length)
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["size"] == 12
+        assert 0 not in seen_sizes
+        assert Path(r["path"]).read_bytes() == bytes(range(12))
+
+    def test_zero_byte_size_and_zero_reflected(self, state: DaemonState, tmp_path: Path) -> None:
+        """byteSize==0 and reflected size 0 → clean error, never dump whole buffer."""
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._cbuffer_descriptors[(ShaderStage.Pixel, 0)] = Descriptor(
+            resource=ResourceId(50),
+            byteOffset=0,
+            byteSize=0,
+        )
+        pipe._reflections[ShaderStage.Pixel].constantBlocks[0].byteSize = 0
+        resp, _ = _handle_request(
+            rpc_request(
+                "cbuffer_raw", {"eid": 10, "set": 0, "binding": 0}, token="abcdef1234567890"
+            ),
+            state,
+        )
+        assert "error" in resp
+        assert not (tmp_path / "cbuffer_10_ps_0_0.bin").exists()
 
 
 class TestVbufferDecode:
@@ -380,6 +771,664 @@ class TestIbufferDecode:
         r = resp["result"]
         assert r["format"] == "none"
         assert r["indices"] == []
+
+
+class TestMeshVsInFallback:
+    def test_empty_postvs_uses_ia_position(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["stage"] == "vs-in"
+        assert r["vertex_count"] == 3
+        assert r["comp_count"] == 3
+        assert r["position_attribute"] == "POSITION"
+        assert r["position_source"] == "semantic"
+        assert r["position_slot"] == 0
+        assert r["position_byte_offset"] == 0
+        assert r["position_format"] == "R32G32B32_FLOAT"
+        assert r["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+        assert r["vertices"][1] == pytest.approx([1.0, -1.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([0.0, 1.0, 0.0])
+
+    def test_empty_postvs_bounds_unknown_vbuffer_size_by_draw_count(
+        self, state: DaemonState
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vbuffers[0].byteSize = (1 << 64) - 1
+        reads: list[tuple[int, int, int]] = []
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            reads.append((int(rid), offset, length))
+            assert length < 1024
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["result"]["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+        assert (42, 0, 60) in reads
+
+    def test_non_indexed_fallback_applies_first_vertex(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        actions = state.adapter.controller.GetRootActions()
+        actions[0].indexOffset = 2
+        actions[0].vertexOffset = 1
+        actions[0].numIndices = 3
+        vbuf_data = _make_vbuffer_data() + struct.pack("<5f", 2.0, 2.0, 0.0, 0.0, 0.0)
+        reads: list[tuple[int, int, int]] = []
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            reads.append((int(rid), offset, length))
+            if int(rid) == 42:
+                return vbuf_data[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        pipe._vbuffers[0].byteSize = len(vbuf_data)
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["indices"] == []
+        assert r["vertex_count"] == 3
+        assert r["vertices"][0] == pytest.approx([1.0, -1.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([2.0, 2.0, 0.0])
+        assert (42, 20, 60) in reads
+
+    def test_fallback_uses_adapter_root_action_compat(self, state: DaemonState) -> None:
+        controller = state.adapter.controller
+        actions = controller.GetRootActions()
+        controller.GetDrawcalls = lambda: actions
+        delattr(controller, "GetRootActions")
+
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["result"]["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+
+    def test_fallback_rejects_when_no_plausible_position_candidate(
+        self, state: DaemonState
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs = [
+            VertexInputAttribute(
+                name="TEXCOORD",
+                vertexBuffer=0,
+                byteOffset=12,
+                format=ResourceFormat(
+                    name="R32G32_UINT",
+                    compByteWidth=4,
+                    compCount=2,
+                ),
+            )
+        ]
+        state.adapter.controller.GetBufferData = pytest.fail
+
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert (
+            resp["error"]["message"]
+            == "no vertex-rate float/vector position candidate at this event"
+        )
+
+    def test_fallback_selects_d3d12_attribute0_over_instance_uint(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs = [
+            VertexInputAttribute(
+                name="ATTRIBUTE0",
+                vertexBuffer=0,
+                byteOffset=0,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+            VertexInputAttribute(
+                name="ATTRIBUTE1",
+                vertexBuffer=1,
+                byteOffset=0,
+                perInstance=True,
+                instanceRate=1,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+            VertexInputAttribute(
+                name="ATTRIBUTE13",
+                vertexBuffer=2,
+                byteOffset=0,
+                perInstance=True,
+                instanceRate=1,
+                format=ResourceFormat(
+                    name="R32_UINT",
+                    compByteWidth=4,
+                    compCount=1,
+                ),
+            ),
+        ]
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(42),
+                byteOffset=0,
+                byteSize=36,
+                byteStride=12,
+            ),
+            BoundVBuffer(
+                resourceId=ResourceId(44),
+                byteOffset=0,
+                byteSize=12,
+                byteStride=12,
+            ),
+            BoundVBuffer(
+                resourceId=ResourceId(45),
+                byteOffset=0,
+                byteSize=4,
+                byteStride=4,
+            ),
+        ]
+        pos_data = struct.pack("<9f", -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0)
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            assert int(rid) == 42
+            return pos_data[offset : offset + length]
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "ATTRIBUTE0"
+        assert r["position_source"] == "heuristic"
+        assert r["position_index"] == 0
+        assert r["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([0.0, 1.0, 0.0])
+
+    def test_fallback_skips_instance_position_semantic(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs = [
+            VertexInputAttribute(
+                name="POSITION",
+                vertexBuffer=1,
+                byteOffset=0,
+                perInstance=True,
+                instanceRate=1,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+            VertexInputAttribute(
+                name="ATTRIBUTE0",
+                vertexBuffer=0,
+                byteOffset=0,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+        ]
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(42),
+                byteOffset=0,
+                byteSize=36,
+                byteStride=12,
+            ),
+            BoundVBuffer(
+                resourceId=ResourceId(44),
+                byteOffset=0,
+                byteSize=12,
+                byteStride=12,
+            ),
+        ]
+        pos_data = struct.pack("<9f", -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0)
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            assert int(rid) == 42
+            return pos_data[offset : offset + length]
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "ATTRIBUTE0"
+        assert r["position_source"] == "heuristic"
+        assert r["vertices"][1] == pytest.approx([1.0, -1.0, 0.0])
+
+    def test_fallback_warns_when_multiple_heuristic_candidates(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs = [
+            VertexInputAttribute(
+                name="ATTRIBUTE0",
+                vertexBuffer=0,
+                byteOffset=0,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+            VertexInputAttribute(
+                name="ATTRIBUTE1",
+                vertexBuffer=0,
+                byteOffset=12,
+                format=ResourceFormat(
+                    name="R32G32B32A32_FLOAT",
+                    compByteWidth=4,
+                    compCount=4,
+                ),
+            ),
+        ]
+        verts = [
+            (-1.0, -1.0, 0.0, 9.0, 9.0, 9.0, 1.0),
+            (1.0, -1.0, 0.0, 8.0, 8.0, 8.0, 1.0),
+            (0.0, 1.0, 0.0, 7.0, 7.0, 7.0, 1.0),
+        ]
+        vdata = b"".join(struct.pack("<7f", *v) for v in verts)
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(42),
+                byteOffset=0,
+                byteSize=len(vdata),
+                byteStride=28,
+            )
+        ]
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            assert int(rid) == 42
+            return vdata[offset : offset + length]
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "ATTRIBUTE0"
+        assert r["position_source"] == "heuristic"
+        assert r["position_warning"] == (
+            "heuristic position selection chose 'ATTRIBUTE0' from 2 candidates; "
+            "use a position override if this is wrong"
+        )
+        assert r["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+
+    def test_position_attribute_override_selects_named_input(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", "position_attribute": "TEXCOORD"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "TEXCOORD"
+        assert r["position_source"] == "user"
+        assert r["position_index"] == 1
+        assert r["position_byte_offset"] == 12
+        assert r["comp_count"] == 2
+        assert r["vertices"][0] == pytest.approx([0.0, 0.0])
+        assert r["vertices"][1] == pytest.approx([1.0, 0.0])
+
+    def test_position_index_override_selects_input_by_index(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", "position_index": 1},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "TEXCOORD"
+        assert r["position_source"] == "user"
+        assert r["vertices"][2] == pytest.approx([0.5, 1.0])
+
+    def test_position_slot_offset_override_selects_input(self, state: DaemonState) -> None:
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", "position_slot": 0, "position_offset": 12},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        r = resp["result"]
+        assert r["position_attribute"] == "TEXCOORD"
+        assert r["position_source"] == "user"
+        assert r["vertices"][0] == pytest.approx([0.0, 0.0])
+
+    def test_position_override_rejects_non_float_format(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs.append(
+            VertexInputAttribute(
+                name="ATTRIBUTE13",
+                vertexBuffer=0,
+                byteOffset=0,
+                format=ResourceFormat(name="R32_UINT", compByteWidth=4, compCount=1),
+            )
+        )
+        state.adapter.controller.GetBufferData = pytest.fail
+
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", "position_attribute": "ATTRIBUTE13"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert (
+            resp["error"]["message"]
+            == "vertex input 'ATTRIBUTE13' format 'R32_UINT' cannot be decoded as position"
+        )
+
+    def test_position_override_reports_selected_input_for_invalid_vbuffer(
+        self, state: DaemonState
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vertex_inputs = [
+            VertexInputAttribute(
+                name="POSITION",
+                vertexBuffer=0,
+                byteOffset=0,
+                format=ResourceFormat(
+                    name="R32G32B32_FLOAT",
+                    compByteWidth=4,
+                    compCount=3,
+                ),
+            ),
+            VertexInputAttribute(
+                name="TEXCOORD",
+                vertexBuffer=1,
+                byteOffset=0,
+                format=ResourceFormat(
+                    name="R32G32_FLOAT",
+                    compByteWidth=4,
+                    compCount=2,
+                ),
+            ),
+        ]
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(42),
+                byteOffset=0,
+                byteSize=36,
+                byteStride=12,
+            ),
+            BoundVBuffer(
+                resourceId=ResourceId(0),
+                byteOffset=0,
+                byteSize=0,
+                byteStride=0,
+            ),
+        ]
+        state.adapter.controller.GetBufferData = pytest.fail
+
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", "position_attribute": "TEXCOORD"},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert resp["error"]["message"] == "vertex buffer for 'TEXCOORD' (slot 1) is not bound"
+
+    @pytest.mark.parametrize(
+        ("params", "expected"),
+        [
+            (
+                {"position_slot": 0},
+                "position slot override requires both position_slot and position_offset",
+            ),
+            (
+                {"position_attribute": "POSITION", "position_index": 0},
+                "use only one position override selector",
+            ),
+            ({"position_index": 99}, "no vertex input at position index 99"),
+            (
+                {"position_slot": 9, "position_offset": 4},
+                "no vertex input at position slot 9 offset 4",
+            ),
+        ],
+    )
+    def test_position_override_validation_errors(
+        self, state: DaemonState, params: dict[str, Any], expected: str
+    ) -> None:
+        state.adapter.controller.GetBufferData = pytest.fail
+        resp, _ = _handle_request(
+            rpc_request(
+                "mesh_data",
+                {"eid": 10, "stage": "vs-in", **params},
+                token="abcdef1234567890",
+            ),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert resp["error"]["message"] == expected
+
+    def test_fallback_requires_draw_action(self, state: DaemonState) -> None:
+        state.adapter.controller.GetRootActions().clear()
+        state.adapter.controller.GetBufferData = pytest.fail
+
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert resp["error"]["message"] == "no draw action found for eid"
+
+    def test_zero_count_indexed_fallback_does_not_read_index_buffer(
+        self, state: DaemonState
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._ibuffer.byteSize = (1 << 64) - 1
+        actions = state.adapter.controller.GetRootActions()
+        actions[0].flags |= ActionFlags.Indexed
+        actions[0].numIndices = 0
+        reads: list[tuple[int, int, int]] = []
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            reads.append((int(rid), offset, length))
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["vertex_count"] == 0
+        assert r["indices"] == []
+        assert reads == []
+
+    def test_matching_postvs_vsin_and_vsout_uses_ia_position(self, state: DaemonState) -> None:
+        postvs = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=12,
+            vertexByteSize=36,
+            numIndices=3,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        postvs_data = struct.pack("<9f", 9.0, 9.0, 9.0, 8.0, 8.0, 8.0, 7.0, 7.0, 7.0)
+        orig_get = state.adapter.controller.GetBufferData
+        state.adapter.controller.GetPostVSData = lambda inst, view, stage: postvs
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            if int(rid) == 99:
+                return postvs_data[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+        assert r["vertices"][0] != pytest.approx([9.0, 9.0, 9.0])
+
+    def test_indexed_fallback_reads_only_referenced_base_vertex_range(
+        self, state: DaemonState
+    ) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(45),
+                byteOffset=0,
+                byteSize=(1 << 64) - 1,
+                byteStride=20,
+            ),
+        ]
+        pipe._ibuffer = BoundVBuffer(
+            resourceId=ResourceId(46),
+            byteOffset=0,
+            byteSize=6,
+            byteStride=2,
+        )
+        actions = state.adapter.controller.GetRootActions()
+        actions[0].flags |= ActionFlags.Indexed
+        actions[0].baseVertex = 100
+        actions[0].numIndices = 3
+        verts = [(float(i), float(-i), 0.0, 0.0, 0.0) for i in range(103)]
+        vbuf_data = b"".join(struct.pack("<5f", *v) for v in verts)
+        ibuf_data = struct.pack("<3H", 0, 1, 2)
+        reads: list[tuple[int, int, int]] = []
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            reads.append((int(rid), offset, length))
+            assert length < 1024
+            if int(rid) == 45:
+                return vbuf_data[offset : offset + length]
+            if int(rid) == 46:
+                return ibuf_data[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["vertex_count"] == 3
+        assert r["indices"] == [0, 1, 2]
+        assert r["vertices"][0] == pytest.approx([100.0, -100.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([102.0, -102.0, 0.0])
+        assert (45, 2000, 60) in reads
+
+    def test_fallback_applies_indices_and_base_vertex(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(45),
+                byteOffset=0,
+                byteSize=100,
+                byteStride=20,
+            ),
+        ]
+        pipe._ibuffer = BoundVBuffer(
+            resourceId=ResourceId(46),
+            byteOffset=0,
+            byteSize=6,
+            byteStride=2,
+        )
+        actions = state.adapter.controller.GetRootActions()
+        actions[0].flags |= ActionFlags.Indexed
+        actions[0].baseVertex = 1
+        actions[0].numIndices = 3
+        vbuf_data = _make_vbuffer_data() + struct.pack("<5f", 2.0, 2.0, 0.0, 0.0, 0.0)
+        ibuf_data = struct.pack("<3H", 0, 1, 2)
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            if int(rid) == 45:
+                return vbuf_data[offset : offset + length]
+            if int(rid) == 46:
+                return ibuf_data[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["vertex_count"] == 3
+        assert r["indices"] == [0, 1, 2]
+        assert r["vertices"][0] == pytest.approx([1.0, -1.0, 0.0])
+        assert r["vertices"][1] == pytest.approx([0.0, 1.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([2.0, 2.0, 0.0])
+
+    def test_indexed_fallback_honors_index_offset(self, state: DaemonState) -> None:
+        pipe = state.adapter.controller.GetPipelineState()
+        pipe._vbuffers = [
+            BoundVBuffer(
+                resourceId=ResourceId(45),
+                byteOffset=0,
+                byteSize=80,
+                byteStride=20,
+            ),
+        ]
+        pipe._ibuffer = BoundVBuffer(
+            resourceId=ResourceId(46),
+            byteOffset=0,
+            byteSize=10,
+            byteStride=2,
+        )
+        actions = state.adapter.controller.GetRootActions()
+        actions[0].flags |= ActionFlags.Indexed
+        actions[0].indexOffset = 2
+        actions[0].vertexOffset = 99
+        actions[0].numIndices = 3
+        vbuf_data = _make_vbuffer_data() + struct.pack("<5f", 2.0, 2.0, 0.0, 0.0, 0.0)
+        ibuf_data = struct.pack("<5H", 99, 98, 0, 1, 2)
+        reads: list[tuple[int, int, int]] = []
+        orig_get = state.adapter.controller.GetBufferData
+
+        def _get(rid: Any, offset: int, length: int) -> bytes:
+            reads.append((int(rid), offset, length))
+            if int(rid) == 45:
+                return vbuf_data[offset : offset + length]
+            if int(rid) == 46:
+                return ibuf_data[offset : offset + length]
+            return orig_get(rid, offset, length)
+
+        state.adapter.controller.GetBufferData = _get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        r = resp["result"]
+        assert r["indices"] == [0, 1, 2]
+        assert r["vertices"][0] == pytest.approx([-1.0, -1.0, 0.0])
+        assert r["vertices"][2] == pytest.approx([0.0, 1.0, 0.0])
+        assert (46, 4, 6) in reads
+        assert (45, 0, 60) in reads
 
 
 # --- P2-MAINT-1: buffer decode helper unit tests ---
@@ -538,3 +1587,251 @@ class TestMeshDataGolden:
         # Restore
         state.adapter.controller.GetBufferData = orig_get
         state.adapter.controller.GetPostVSData = orig_postvs
+
+    def test_postvs_rejects_unknown_vertex_byte_size(self, state: DaemonState) -> None:
+        """PostVS decode should not turn an unresolved size sentinel into a huge read."""
+        mesh = SimpleNamespace(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=16,
+            vertexByteOffset=0,
+            vertexByteSize=(1 << 64) - 1,
+            numIndices=3,
+            indexResourceId=ResourceId(0),
+            format=ResourceFormat(name="R32G32B32A32_FLOAT", compByteWidth=4, compCount=4),
+            topology="TriangleList",
+        )
+
+        def _fail_get(*args: Any) -> bytes:
+            pytest.fail("unknown PostVS byte size should not read buffer data")
+
+        state.adapter.controller.GetPostVSData = lambda inst, view, stage: mesh
+        state.adapter.controller.GetBufferData = _fail_get
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-out"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert resp["error"]["message"] == "PostVS vertex buffer size is unknown"
+
+
+class TestMeshDataVsIn:
+    """mesh_data handler accepts the vs-in stage (issue #224)."""
+
+    def test_vs_in_decodes_geometry(self, tmp_path: Path) -> None:
+        """stage=vs-in calls GetPostVSData with stage int 0 and decodes vertices."""
+        vdata = struct.pack("<9f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0)
+        idata = struct.pack("<3H", 0, 1, 2)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=12,
+            vertexByteOffset=0,
+            vertexByteSize=len(vdata),
+            numIndices=3,
+            indexResourceId=ResourceId(98),
+            indexByteOffset=0,
+            indexByteSize=len(idata),
+            indexByteStride=2,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        ctrl = MockReplayController()
+        ctrl._actions = _build_actions()
+        ctrl._buffer_data[99] = vdata
+        ctrl._buffer_data[98] = idata
+        ctrl.set_mesh_data(0, mesh)
+
+        s = DaemonState(capture="test.rdc", current_eid=0, token="abcdef1234567890")
+        s.adapter = RenderDocAdapter(controller=ctrl, version=(1, 41))
+        s.max_eid = 10
+        s.rd = mock_rd
+        s.temp_dir = tmp_path
+        s.vfs_tree = build_vfs_skeleton(ctrl._actions, [])
+
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            s,
+        )
+        r = resp["result"]
+        assert r["stage"] == "vs-in"
+        assert r["vertex_count"] == 3
+        assert r["vertices"][0] == pytest.approx([1.0, 2.0, 3.0])
+        assert r["vertices"][2] == pytest.approx([7.0, 8.0, 9.0])
+
+    def test_vs_in_without_postvs_or_ia_returns_error(self, state: DaemonState) -> None:
+        """stage=vs-in fails only when neither PostVS nor IA has a position candidate."""
+        empty = SimpleNamespace(vertexResourceId=ResourceId(0), vertexByteStride=0)
+        orig_postvs = state.adapter.controller.GetPostVSData
+        state.adapter.controller.GetPostVSData = lambda inst, view, stage: empty
+        state.adapter.controller.GetPipelineState()._vertex_inputs = []
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"),
+            state,
+        )
+        assert resp["error"]["code"] == -32001
+        assert (
+            resp["error"]["message"]
+            == "no vertex-rate float/vector position candidate at this event"
+        )
+        state.adapter.controller.GetPostVSData = orig_postvs
+
+    def test_invalid_stage_lists_vs_in(self, state: DaemonState) -> None:
+        """An unknown stage error message lists vs-in, vs-out and gs-out."""
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "hs-out"}, token="abcdef1234567890"),
+            state,
+        )
+        msg = resp["error"]["message"]
+        assert "vs-in" in msg
+        assert "vs-out" in msg
+        assert "gs-out" in msg
+
+
+def _vsin_state(tmp_path: Path, mesh: MeshFormat, buffers: dict[int, bytes]) -> DaemonState:
+    """Build a DaemonState whose VSIn stage returns the given MeshFormat."""
+    ctrl = MockReplayController()
+    ctrl._actions = _build_actions()
+    for rid, data in buffers.items():
+        ctrl._buffer_data[rid] = data
+    ctrl.set_mesh_data(0, mesh)
+    s = DaemonState(capture="test.rdc", current_eid=0, token="abcdef1234567890")
+    s.adapter = RenderDocAdapter(controller=ctrl, version=(1, 41))
+    s.max_eid = 10
+    s.rd = mock_rd
+    s.temp_dir = tmp_path
+    s.vfs_tree = build_vfs_skeleton(ctrl._actions, [])
+    return s
+
+
+class TestMeshDataBaseVertex:
+    """baseVertex and vertexByteOffset correctness (RenderDoc decode_mesh parity)."""
+
+    def test_base_vertex_shifts_indices(self, tmp_path: Path) -> None:
+        """Decoded indices are offset by mesh.baseVertex like RenderDoc's reference."""
+        vdata = struct.pack("<9f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0)
+        idata = struct.pack("<3H", 0, 1, 2)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=12,
+            vertexByteSize=len(vdata),
+            baseVertex=4,
+            numIndices=3,
+            indexResourceId=ResourceId(98),
+            indexByteSize=len(idata),
+            indexByteStride=2,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        s = _vsin_state(tmp_path, mesh, {99: vdata, 98: idata})
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"), s
+        )
+        assert resp["result"]["indices"] == [4, 5, 6]
+
+    def test_vs_out_base_vertex_zero_unchanged(self, tmp_path: Path) -> None:
+        """vs-out with baseVertex==0 keeps indices unshifted (regression)."""
+        vdata = struct.pack("<8f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+        idata = struct.pack("<3H", 0, 1, 1)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(70),
+            vertexByteStride=16,
+            vertexByteSize=len(vdata),
+            baseVertex=0,
+            numIndices=3,
+            indexResourceId=ResourceId(71),
+            indexByteSize=len(idata),
+            indexByteStride=2,
+            format=ResourceFormat(name="R32G32B32A32_FLOAT", compByteWidth=4, compCount=4),
+            topology="TriangleList",
+        )
+        ctrl = MockReplayController()
+        ctrl._actions = _build_actions()
+        ctrl._buffer_data[70] = vdata
+        ctrl._buffer_data[71] = idata
+        ctrl.set_mesh_data(1, mesh)
+        s = DaemonState(capture="test.rdc", current_eid=0, token="abcdef1234567890")
+        s.adapter = RenderDocAdapter(controller=ctrl, version=(1, 41))
+        s.max_eid = 10
+        s.rd = mock_rd
+        s.temp_dir = tmp_path
+        s.vfs_tree = build_vfs_skeleton(ctrl._actions, [])
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-out"}, token="abcdef1234567890"), s
+        )
+        assert resp["result"]["indices"] == [0, 1, 1]
+
+    def test_vertex_byte_offset_reads_position(self, tmp_path: Path) -> None:
+        """Position is read at i*stride + vertexByteOffset (POSITION not first)."""
+        # stride=20: 8 bytes padding then vec3 position
+        verts = [
+            (0.0, 0.0, 1.0, 2.0, 3.0),
+            (0.0, 0.0, 4.0, 5.0, 6.0),
+            (0.0, 0.0, 7.0, 8.0, 9.0),
+        ]
+        vdata = b"".join(struct.pack("<5f", *v) for v in verts)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=20,
+            vertexByteOffset=8,
+            vertexByteSize=len(vdata),
+            numIndices=3,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        s = _vsin_state(tmp_path, mesh, {99: vdata})
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"), s
+        )
+        r = resp["result"]
+        assert r["vertices"][0] == pytest.approx([1.0, 2.0, 3.0])
+        assert r["vertices"][2] == pytest.approx([7.0, 8.0, 9.0])
+
+    def test_16bit_index_buffer_decoded(self, tmp_path: Path) -> None:
+        """A 16-bit index buffer decodes per indexByteStride=2."""
+        vdata = struct.pack("<12f", *range(12))
+        idata = struct.pack("<4H", 0, 1, 2, 3)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=12,
+            vertexByteSize=len(vdata),
+            numIndices=4,
+            indexResourceId=ResourceId(98),
+            indexByteSize=len(idata),
+            indexByteStride=2,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        s = _vsin_state(tmp_path, mesh, {99: vdata, 98: idata})
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"), s
+        )
+        assert resp["result"]["indices"] == [0, 1, 2, 3]
+
+    def test_base_vertex_with_offset_combined(self, tmp_path: Path) -> None:
+        """baseVertex and vertexByteOffset apply together (full decode_mesh parity)."""
+        verts = [
+            (0.0, 0.0, 1.0, 2.0, 3.0),
+            (0.0, 0.0, 4.0, 5.0, 6.0),
+            (0.0, 0.0, 7.0, 8.0, 9.0),
+        ]
+        vdata = b"".join(struct.pack("<5f", *v) for v in verts)
+        idata = struct.pack("<3I", 0, 1, 2)
+        mesh = MeshFormat(
+            vertexResourceId=ResourceId(99),
+            vertexByteStride=20,
+            vertexByteOffset=8,
+            vertexByteSize=len(vdata),
+            baseVertex=10,
+            numIndices=3,
+            indexResourceId=ResourceId(98),
+            indexByteSize=len(idata),
+            indexByteStride=4,
+            format=ResourceFormat(name="R32G32B32_FLOAT", compByteWidth=4, compCount=3),
+            topology="TriangleList",
+        )
+        s = _vsin_state(tmp_path, mesh, {99: vdata, 98: idata})
+        resp, _ = _handle_request(
+            rpc_request("mesh_data", {"eid": 10, "stage": "vs-in"}, token="abcdef1234567890"), s
+        )
+        r = resp["result"]
+        assert r["indices"] == [10, 11, 12]
+        assert r["vertices"][1] == pytest.approx([4.0, 5.0, 6.0])

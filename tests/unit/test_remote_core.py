@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from rdc.remote_core import (
+    _normalize_remote_host,
     build_conn_url,
     connect_remote_server,
     enumerate_remote_targets,
@@ -19,6 +20,29 @@ from rdc.remote_core import (
 )
 
 
+class TestNormalizeRemoteHost:
+    def test_localhost(self) -> None:
+        assert _normalize_remote_host("localhost") == "127.0.0.1"
+
+    def test_localhost_upper(self) -> None:
+        assert _normalize_remote_host("LOCALHOST") == "127.0.0.1"
+
+    def test_localhost_mixed_case(self) -> None:
+        assert _normalize_remote_host("Localhost") == "127.0.0.1"
+
+    def test_ipv4_unchanged(self) -> None:
+        assert _normalize_remote_host("127.0.0.1") == "127.0.0.1"
+
+    def test_private_ipv4_unchanged(self) -> None:
+        assert _normalize_remote_host("192.168.1.5") == "192.168.1.5"
+
+    def test_ipv6_loopback_unchanged(self) -> None:
+        assert _normalize_remote_host("::1") == "::1"
+
+    def test_hostname_unchanged(self) -> None:
+        assert _normalize_remote_host("myserver.local") == "myserver.local"
+
+
 class TestParseUrl:
     def test_host_only(self) -> None:
         assert parse_url("192.168.1.10") == ("192.168.1.10", 39920)
@@ -27,7 +51,10 @@ class TestParseUrl:
         assert parse_url("192.168.1.10:12345") == ("192.168.1.10", 12345)
 
     def test_localhost(self) -> None:
-        assert parse_url("localhost") == ("localhost", 39920)
+        assert parse_url("localhost") == ("127.0.0.1", 39920)
+
+    def test_localhost_with_port(self) -> None:
+        assert parse_url("localhost:39920") == ("127.0.0.1", 39920)
 
     def test_ipv6_brackets(self) -> None:
         assert parse_url("[::1]:39920") == ("::1", 39920)
@@ -72,14 +99,32 @@ class TestBuildConnUrl:
     def test_ipv4(self) -> None:
         assert build_conn_url("192.168.1.1", 39920) == "192.168.1.1:39920"
 
-    def test_hostname(self) -> None:
-        assert build_conn_url("localhost", 39920) == "localhost:39920"
+    def test_ipv4_localhost_unchanged(self) -> None:
+        assert build_conn_url("127.0.0.1", 39920) == "127.0.0.1:39920"
+
+    def test_localhost_normalized(self) -> None:
+        assert build_conn_url("localhost", 39920) == "127.0.0.1:39920"
 
     def test_ipv6_re_brackets(self) -> None:
         assert build_conn_url("::1", 39920) == "[::1]:39920"
 
     def test_ipv6_long(self) -> None:
         assert build_conn_url("2001:db8::1", 8080) == "[2001:db8::1]:8080"
+
+
+class TestStateKeyConsistency:
+    def test_parsed_localhost_keys_on_ipv4(self) -> None:
+        from rdc.remote_state import _state_path
+
+        host, port = parse_url("localhost:39920")
+        assert (host, port) == ("127.0.0.1", 39920)
+        path = _state_path(host, port)
+        # The state-file key must use the normalized IPv4, never "localhost".
+        # (Assert on the relative key, not the absolute path, since the isolated
+        # data dir lives under a per-test tmp directory whose name may itself
+        # contain "localhost".)
+        assert path.name == "127.0.0.1_39920.json"
+        assert "localhost" not in path.parent.name
 
 
 class TestWarnIfPublic:
@@ -134,6 +179,18 @@ class TestConnectRemoteServer:
         rd.CreateRemoteServerConnection.return_value = (1, None)
         with pytest.raises(RuntimeError, match="connection failed"):
             connect_remote_server(rd, "192.168.1.10:39920")
+
+    def test_failure_hint_mentions_rdc_serve_and_url(self) -> None:
+        """T24: failure message carries hint referencing 'rdc serve' and the URL."""
+        rd = MagicMock()
+        rd.CreateRemoteServerConnection.return_value = (1, None)
+        url = "192.168.1.10:39920"
+        with pytest.raises(RuntimeError) as exc_info:
+            connect_remote_server(rd, url)
+        msg = str(exc_info.value)
+        assert "hint:" in msg
+        assert "rdc serve" in msg
+        assert url in msg
 
     def test_int_result_code(self) -> None:
         rd = MagicMock()
@@ -256,6 +313,33 @@ class TestRemoteCapture:
         result = remote_capture(rd, remote, "host", "/app", output="/tmp/out.rdc")
         assert not result.success
         assert "inject failed" in result.error
+        assert "hint:" in result.error
+
+    def test_zero_ident_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """T24: remote inject returning ident=0 with success result carries hint."""
+        rd = MagicMock()
+        remote = MagicMock()
+        remote.ExecuteAndInject.return_value = SimpleNamespace(result=0, ident=0)
+        monkeypatch.setattr("rdc.remote_core.build_capture_options", lambda opts: MagicMock())
+
+        result = remote_capture(rd, remote, "host", "/app", output="/tmp/out.rdc")
+        assert not result.success
+        assert "zero ident" in result.error
+        assert "check target permissions" in result.error
+
+    def test_remote_inject_hint_is_neutral(self) -> None:
+        """Remote inject hint must not include host-OS-specific guidance (target OS unknown)."""
+        from rdc.capture_core import _remote_inject_failure_hint
+
+        hint = _remote_inject_failure_hint()
+        assert "check target permissions" in hint
+        # Must mention cross-platform hints generically, not as a host-OS-specific verdict.
+        lowered = hint.lower()
+        assert "apparmor/selinux/sip" in lowered
+        # No standalone platform-specific phrasing that falsely implies target OS.
+        assert "disable sip" not in lowered
+        assert "run as administrator" not in lowered
+        assert "may be blocking" not in lowered
 
     def test_tc_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rd = MagicMock()

@@ -254,6 +254,225 @@ def _make_subresource(rd: Any, mip: int = 0) -> Any:
     return sub
 
 
+def _srgb_encode(linear: Any) -> Any:
+    """Apply the sRGB OETF to a clipped [0, 1] float array."""
+    import numpy as np
+
+    lo = linear <= 0.0031308
+    return np.where(lo, linear * 12.92, 1.055 * np.power(linear, 1.0 / 2.4) - 0.055)
+
+
+def _decode_dtype(rd: Any, comp_type: int, comp_byte_width: int) -> str | None:
+    """numpy dtype name for a (CompType, compByteWidth) pair, or None to reject.
+
+    Pairs absent from this map have no unambiguous 8-bit display mapping
+    (Typeless, SInt, UScaled, SScaled, exotic widths) and are rejected rather
+    than guessed. Float covers half/single; packed floats (R11G11B10, R9G9B9E5)
+    are non-Regular and never reach here.
+    """
+    ct = rd.CompType
+    table: dict[tuple[int, int], str] = {
+        (int(ct.Float), 2): "float16",
+        (int(ct.Float), 4): "float32",
+        (int(ct.UNorm), 1): "uint8",
+        (int(ct.UNorm), 2): "uint16",
+        (int(ct.UNormSRGB), 1): "uint8",
+        (int(ct.SNorm), 1): "int8",
+        (int(ct.SNorm), 2): "int16",
+        (int(ct.UInt), 1): "uint8",
+        (int(ct.UInt), 2): "uint16",
+        (int(ct.Depth), 1): "uint8",
+        (int(ct.Depth), 2): "uint16",
+        (int(ct.Depth), 4): "float32",
+    }
+    return table.get((comp_type, comp_byte_width))
+
+
+def _unpack_float_component(exp: Any, mant: Any, mant_bits: int) -> Any:
+    """Decode a no-sign mini-float component to float32 (vectorised).
+
+    exp/mant are uint arrays of the same shape. ``mant_bits`` is the mantissa
+    width (6 for the 11-bit channels, 5 for the 10-bit channel); the exponent is
+    always 5 bits (bias 15, max value 31 reserved for Inf/NaN).
+    """
+    import numpy as np
+
+    scale = float(1 << mant_bits)
+    frac = mant.astype(np.float32) / np.float32(scale)
+    subnormal = frac * np.float32(2.0**-14)
+    normal = (np.float32(1.0) + frac) * np.exp2(exp.astype(np.float32) - np.float32(15))
+    inf_nan = np.where(mant == 0, np.float32(np.inf), np.float32(np.nan))
+    out = np.where(exp == 0, subnormal, normal)
+    out = np.where(exp == 31, inf_nan, out)
+    return out.astype(np.float32)
+
+
+def _unpack_r11g11b10(words: Any) -> Any:
+    """Decode R11G11B10_FLOAT uint32 words to a float32 (N, 3) RGB array.
+
+    R: bits [0:11) (5-bit exp, 6-bit mantissa), G: bits [11:22) (same layout),
+    B: bits [22:32) (5-bit exp, 5-bit mantissa). No sign; exponent bias 15.
+    """
+    import numpy as np
+
+    r = words & np.uint32(0x7FF)
+    g = (words >> np.uint32(11)) & np.uint32(0x7FF)
+    b = (words >> np.uint32(22)) & np.uint32(0x3FF)
+    rv = _unpack_float_component(r >> np.uint32(6), r & np.uint32(0x3F), 6)
+    gv = _unpack_float_component(g >> np.uint32(6), g & np.uint32(0x3F), 6)
+    bv = _unpack_float_component(b >> np.uint32(5), b & np.uint32(0x1F), 5)
+    return np.stack([rv, gv, bv], axis=-1).astype(np.float32)
+
+
+def _unpack_r9g9b9e5(words: Any) -> Any:
+    """Decode R9G9B9E5_SHAREDEXP uint32 words to a float32 (N, 3) RGB array.
+
+    R/G/B 9-bit mantissas at [0:9), [9:18), [18:27); shared 5-bit exponent at
+    [27:32). value = mant * 2^(exp - 24). No reserved exponent, no Inf/NaN.
+    """
+    import numpy as np
+
+    rm = (words & np.uint32(0x1FF)).astype(np.float32)
+    gm = ((words >> np.uint32(9)) & np.uint32(0x1FF)).astype(np.float32)
+    bm = ((words >> np.uint32(18)) & np.uint32(0x1FF)).astype(np.float32)
+    exp = ((words >> np.uint32(27)) & np.uint32(0x1F)).astype(np.float32)
+    scale = np.exp2(exp - np.float32(24))
+    return np.stack([rm * scale, gm * scale, bm * scale], axis=-1).astype(np.float32)
+
+
+def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bool) -> bytes | None:
+    """Decode tightly packed GetTextureData bytes into PNG bytes.
+
+    Handles the full ``ResourceFormatType.Regular`` space deliberately: every
+    (CompType, compByteWidth) pair we can display is mapped to a numpy dtype and
+    an explicit 8-bit conversion. Any pair not in the table (Typeless, SInt,
+    UScaled, SScaled, exotic widths), every non-Regular format (block-compressed,
+    packed, combined depth-stencil), MSAA, length mismatches, and empty data all
+    return ``None`` so the caller emits a clean error rather than a wrong image.
+
+    Args:
+        rd: The renderdoc module.
+        tex: TextureDescription for the resource.
+        raw: Tightly packed pixel bytes for one subresource (top-down).
+        mip: Mip level the bytes correspond to.
+        is_depth: Whether to render the data as a single grayscale depth channel.
+
+    For 3D textures (``depth > 1``) ``GetTextureData`` returns the whole
+    width*height*depth mip. Every depth slice is tiled vertically into a single
+    ``(depth*height, width)`` image so no slice is silently dropped; all slices
+    share the same channel/sRGB/BGRA/expand processing. ``depth == 1`` is
+    byte-for-byte identical to the 2D path.
+
+    Returns:
+        PNG-encoded bytes, or ``None`` if the format cannot be decoded.
+    """
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    if not raw:
+        return None
+
+    fmt = tex.format
+
+    # Packed HDR formats: 4 bytes/pixel, closed-form numpy decode. Non-Regular,
+    # so they must be handled before the Regular gate (which would reject them);
+    # they carry their own MSAA guard and local dimension/length computation.
+    if fmt.type in (rd.ResourceFormatType.R11G11B10, rd.ResourceFormatType.R9G9B9E5):
+        if getattr(tex, "msSamp", 1) > 1:
+            return None
+        width = max(1, tex.width >> mip)
+        height = max(1, tex.height >> mip)
+        depth_lvl = max(1, getattr(tex, "depth", 1) >> mip)
+        if len(raw) != width * height * depth_lvl * 4:
+            return None
+        words = np.frombuffer(raw, dtype=np.dtype("<u4")).reshape((depth_lvl * height, width))
+        flat = words.ravel()
+        if fmt.type == rd.ResourceFormatType.R11G11B10:
+            rgb = _unpack_r11g11b10(flat)
+        else:
+            rgb = _unpack_r9g9b9e5(flat)
+        rgb_img = rgb.reshape((depth_lvl * height, width, 3))
+        sanitized = np.nan_to_num(rgb_img, nan=0.0, posinf=1.0, neginf=0.0)
+        f = np.clip(sanitized, 0.0, 1.0)
+        alpha = np.full((depth_lvl * height, width, 1), 255, np.uint8)
+        rgb8 = (_srgb_encode(f) * 255.0).round().astype(np.uint8)
+        out = np.concatenate([rgb8, alpha], axis=2)
+        buf = io.BytesIO()
+        Image.fromarray(out, mode="RGBA").save(buf, format="PNG")
+        return buf.getvalue()
+
+    if fmt.type != rd.ResourceFormatType.Regular:
+        return None
+    if getattr(tex, "msSamp", 1) > 1:
+        return None
+
+    width = max(1, tex.width >> mip)
+    height = max(1, tex.height >> mip)
+    depth_lvl = max(1, getattr(tex, "depth", 1) >> mip)
+    cc = fmt.compCount
+    cbw = fmt.compByteWidth
+    if cc <= 0 or len(raw) != width * height * depth_lvl * cc * cbw:
+        return None
+
+    ct = int(fmt.compType)
+    dtype_name = _decode_dtype(rd, ct, cbw)
+    if dtype_name is None:
+        return None
+    # Tile depth slices vertically: (depth*height, width, cc).
+    arr = np.frombuffer(raw, dtype=np.dtype(dtype_name)).reshape((depth_lvl * height, width, cc))
+    height = depth_lvl * height
+
+    if is_depth:
+        d = arr[:, :, 0].astype(np.float32)
+        d_min, d_max = float(d.min()), float(d.max())
+        norm = (d - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(d)
+        gray = (norm * 255.0).round().astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(gray, mode="L").save(buf, format="PNG")
+        return buf.getvalue()
+
+    if ct == int(rd.CompType.Float):
+        sanitized = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+        f = np.clip(sanitized, 0.0, 1.0)
+        if cc == 4:
+            rgb8 = (_srgb_encode(f[:, :, :3]) * 255.0).round().astype(np.uint8)
+            a8 = (f[:, :, 3:4] * 255.0).round().astype(np.uint8)
+            rgba8 = np.concatenate([rgb8, a8], axis=2)
+        else:
+            rgba8 = (_srgb_encode(f) * 255.0).round().astype(np.uint8)
+    elif ct == int(rd.CompType.SNorm):
+        # [-1, 1] -> [0, 1]; divisor is the signed-int max for the width.
+        denom = float(np.iinfo(np.dtype(dtype_name)).max)
+        f = np.clip(arr.astype(np.float32) / denom, -1.0, 1.0) * 0.5 + 0.5
+        rgba8 = (f * 255.0).round().astype(np.uint8)
+    elif dtype_name == "uint16":
+        rgba8 = (arr / 257.0).round().astype(np.uint8)
+    else:
+        rgba8 = arr.astype(np.uint8)
+
+    if fmt.BGRAOrder() and cc >= 3:
+        rgba8 = rgba8[:, :, [2, 1, 0] + list(range(3, cc))]
+
+    if cc == 1:
+        rgb = np.repeat(rgba8, 3, axis=2)
+        out = np.dstack([rgb, np.full((height, width, 1), 255, np.uint8)])
+    elif cc == 2:
+        zero = np.zeros((height, width, 1), np.uint8)
+        alpha = np.full((height, width, 1), 255, np.uint8)
+        out = np.concatenate([rgba8, zero, alpha], axis=2)
+    elif cc == 3:
+        alpha = np.full((height, width, 1), 255, np.uint8)
+        out = np.concatenate([rgba8, alpha], axis=2)
+    else:
+        out = rgba8
+
+    buf = io.BytesIO()
+    Image.fromarray(out, mode="RGBA").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def require_pipe(params: dict[str, Any], state: DaemonState, request_id: int) -> tuple[int, Any]:
     """Validate adapter, set eid, return pipe_state.
 
@@ -289,6 +508,58 @@ def get_default_disasm_target(controller: Any) -> str:
     return str(targets[0]) if targets else "SPIR-V"
 
 
+def _shader_value_lane_name(var_type: Any) -> str:
+    """Return the ShaderValue lane name for a reflected variable type."""
+    if isinstance(var_type, int):
+        return {
+            0: "f32v",
+            1: "f64v",
+            2: "f16v",
+            3: "s32v",
+            4: "u32v",
+            5: "s16v",
+            6: "u16v",
+            7: "s64v",
+            8: "u64v",
+            9: "s8v",
+            10: "u8v",
+            11: "u32v",
+        }.get(var_type, "f32v")
+
+    type_name = getattr(var_type, "name", var_type)
+    type_str = str(type_name).lower()
+    if "double" in type_str or type_str in {"f64", "float64"}:
+        return "f64v"
+    if "half" in type_str or type_str in {"f16", "float16"}:
+        return "f16v"
+    if "uint64" in type_str or "ulong" in type_str or type_str == "u64":
+        return "u64v"
+    if "uint16" in type_str or "ushort" in type_str or type_str == "u16":
+        return "u16v"
+    if "uint8" in type_str or "ubyte" in type_str or type_str == "u8":
+        return "u8v"
+    if "uint" in type_str or type_str in {"u32", "uint32"}:
+        return "u32v"
+    if "int64" in type_str or "slong" in type_str or type_str in {"s64", "long"}:
+        return "s64v"
+    if "int16" in type_str or "sshort" in type_str or type_str in {"s16", "short"}:
+        return "s16v"
+    if "int8" in type_str or "sbyte" in type_str or type_str == "s8":
+        return "s8v"
+    if "sint" in type_str or "int" in type_str or type_str in {"s32", "int32"}:
+        return "s32v"
+    if "bool" in type_str:
+        return "u32v"
+    return "f32v"
+
+
+def _shader_value_lane_fallback(lane_name: str) -> list[float | int]:
+    """Return a type-stable fallback for a missing ShaderValue lane."""
+    if lane_name.startswith(("u", "s")):
+        return [0] * 16
+    return [0.0] * 16
+
+
 def _flatten_shader_var(var: Any) -> dict[str, Any]:
     """Recursively convert a ShaderVariable to a dict."""
     members = getattr(var, "members", [])
@@ -310,13 +581,8 @@ def _flatten_shader_var(var: Any) -> dict[str, Any]:
     if val is None:
         values: list[Any] = []
     else:
-        type_str = str(getattr(var, "type", "")).lower()
-        if "uint" in type_str:
-            values = list(getattr(val, "u32v", [0.0] * 16)[:count])
-        elif "int" in type_str or "sint" in type_str:
-            values = list(getattr(val, "s32v", [0] * 16)[:count])
-        else:
-            values = list(getattr(val, "f32v", [0.0] * 16)[:count])
+        lane_name = _shader_value_lane_name(getattr(var, "type", ""))
+        values = list(getattr(val, lane_name, _shader_value_lane_fallback(lane_name))[:count])
 
     return {
         "name": var.name,

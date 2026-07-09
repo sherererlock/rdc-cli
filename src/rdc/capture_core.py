@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
@@ -96,10 +97,10 @@ def _discover_latest_target(rd: Any, timeout: float = 5.0) -> int:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         latest = 0
-        ident = rd.EnumerateRemoteTargets("localhost", 0)
+        ident = rd.EnumerateRemoteTargets("127.0.0.1", 0)
         while ident != 0:
             latest = ident
-            ident = rd.EnumerateRemoteTargets("localhost", ident)
+            ident = rd.EnumerateRemoteTargets("127.0.0.1", ident)
         if latest != 0:
             return latest
         time.sleep(0.25)
@@ -115,6 +116,59 @@ def _get_pid_for_ident(rd: Any, ident: int) -> int:
         return tc.GetPID() if tc.Connected() else 0
     finally:
         tc.Shutdown()
+
+
+def _make_env_mod(rd: Any, name: str, value: str) -> Any:
+    """Create a RenderDoc EnvironmentModification with Set/NoSep semantics."""
+    mod = rd.EnvironmentModification()
+    mod.name = name
+    mod.value = value
+    mod.mod = rd.EnvMod.Set
+    mod.sep = rd.EnvSep.NoSep
+    return mod
+
+
+def _build_launch_env(rd: Any) -> list[Any]:
+    """Build environment modifications for a reliable local capture launch."""
+    if sys.platform != "win32":
+        return []
+
+    module_path = getattr(rd, "__file__", None)
+    if not module_path:
+        return []
+
+    renderdoc_dir = Path(module_path).resolve().parent
+    if not (renderdoc_dir / "renderdoc.json").is_file():
+        return []
+
+    return [
+        _make_env_mod(rd, "ENABLE_VULKAN_RENDERDOC_CAPTURE", "1"),
+        _make_env_mod(rd, "VK_IMPLICIT_LAYER_PATH", str(renderdoc_dir)),
+    ]
+
+
+def _inject_failure_hint() -> str:
+    if sys.platform == "darwin":
+        return (
+            "SIP may be blocking injection; "
+            "disable SIP for the target or attach via renderdoccmd; "
+            "for child processes, use --hook-children"
+        )
+    if sys.platform == "win32":
+        return "try running rdc as Administrator; for child processes, use --hook-children"
+    return (
+        "process may be blocked by AppArmor/SELinux or missing privileges; "
+        "for child processes, use --hook-children"
+    )
+
+
+def _remote_inject_failure_hint() -> str:
+    """OS-neutral hint for remote inject failures (target OS is unknown from host)."""
+    return (
+        "check target permissions (root/Administrator, AppArmor/SELinux/SIP), "
+        "firewall, and that the target's graphics API matches renderdoc capabilities; "
+        "for child processes, use --hook-children"
+    )
 
 
 def execute_and_capture(
@@ -161,16 +215,18 @@ def execute_and_capture(
             app_path = Path(workdir) / app_path
         app = str(app_path.resolve())
 
-    result = rd.ExecuteAndInject(app, workdir or "", args, [], output, opts, wait_for_exit)
+    _inj_hint = _inject_failure_hint()
+    env_mods = _build_launch_env(rd)
+    result = rd.ExecuteAndInject(app, workdir or "", args, env_mods, output, opts, wait_for_exit)
     if result.result != 0:
-        return CaptureResult(error=f"inject failed (code {result.result})")
+        return CaptureResult(error=f"inject failed (code {result.result}) -- hint: {_inj_hint}")
 
     ident = result.ident
     if ident == 0:
         # Some renderdoc builds return ident=0 even on success; discover via enumeration.
         ident = _discover_latest_target(rd, timeout=5.0)
         if ident == 0:
-            return CaptureResult(error="inject returned zero ident")
+            return CaptureResult(error=f"inject returned zero ident -- hint: {_inj_hint}")
         log.debug("discovered target ident %d via enumeration", ident)
 
     if trigger:

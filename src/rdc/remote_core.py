@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from typing import Any
@@ -9,7 +10,12 @@ from typing import Any
 import click
 
 from rdc._progress import make_progress_cb
-from rdc.capture_core import CaptureResult, build_capture_options, run_target_control_loop
+from rdc.capture_core import (
+    CaptureResult,
+    _remote_inject_failure_hint,
+    build_capture_options,
+    run_target_control_loop,
+)
 
 _PRIVATE_NETS = (
     re.compile(r"^10\."),
@@ -25,13 +31,36 @@ _PRIVATE_NETS = (
 DEFAULT_PORT = 39920
 
 
+def _normalize_remote_host(host: str) -> str:
+    """Map the literal ``localhost`` (case-insensitive) to ``127.0.0.1``.
+
+    The RenderDoc remote protocol is IPv4-only: ``renderdoccmd remoteserver``
+    binds ``0.0.0.0`` and never listens on ``::1``, but ``localhost`` resolves
+    to ``::1`` first on dual-stack hosts, causing a silent indefinite stall.
+    Everything else (``::1`` literals, IPv6 addresses, real hostnames) is
+    returned unchanged.
+    """
+    if host.lower() == "localhost":
+        logging.getLogger(__name__).debug(
+            "normalizing 'localhost' -> '127.0.0.1' (RenderDoc remote protocol is IPv4-only)"
+        )
+        return "127.0.0.1"
+    return host
+
+
 def is_protocol_url(url: str) -> bool:
     """Return True if url is a device protocol URL (e.g. adb://SERIAL)."""
     return "://" in url
 
 
 def build_conn_url(host: str, port: int) -> str:
-    """Build connection URL, re-bracketing IPv6 addresses."""
+    """Build connection URL, re-bracketing IPv6 addresses.
+
+    Normalizes ``localhost`` here too, so hosts loaded from pre-fix state files
+    (``_resolve_url`` -> ``load_latest_remote_state``) and split-mode daemon
+    handlers cannot escape IPv4 normalization.
+    """
+    host = _normalize_remote_host(host)
     if ":" in host:
         return f"[{host}]:{port}"
     return f"{host}:{port}"
@@ -80,8 +109,8 @@ def parse_url(url: str) -> tuple[str, int]:
             raise ValueError(f"invalid port: {port_str!r}") from None
         if not (1 <= port <= 65535):
             raise ValueError(f"invalid port: {port_str!r}")
-        return host, port
-    return url, DEFAULT_PORT
+        return _normalize_remote_host(host), port
+    return _normalize_remote_host(url), DEFAULT_PORT
 
 
 def connect_remote_server(rd: Any, url: str) -> Any:
@@ -100,7 +129,9 @@ def connect_remote_server(rd: Any, url: str) -> Any:
     result, remote = rd.CreateRemoteServerConnection(url)
     if result != 0:
         msg = getattr(result, "Message", lambda: f"code {result}")()
-        raise RuntimeError(f"connection failed: {msg}")
+        raise RuntimeError(
+            f"connection failed: {msg} -- hint: verify 'rdc serve' is running on {url}"
+        )
     return remote
 
 
@@ -151,11 +182,12 @@ def remote_capture(
     env_mods: list[Any] = []
     exec_result = remote.ExecuteAndInject(app, workdir, args, env_mods, capture_opts)
 
+    _inj_hint = _remote_inject_failure_hint()
     if exec_result.result != 0:
         msg = getattr(exec_result.result, "Message", lambda: f"code {exec_result.result}")()
-        return CaptureResult(error=f"remote inject failed: {msg}")
+        return CaptureResult(error=f"remote inject failed: {msg} -- hint: {_inj_hint}")
     if exec_result.ident == 0:
-        return CaptureResult(error="remote inject returned zero ident")
+        return CaptureResult(error=f"remote inject returned zero ident -- hint: {_inj_hint}")
 
     tc = rd.CreateTargetControl(url, exec_result.ident, "rdc-cli", True)
     if tc is None:
