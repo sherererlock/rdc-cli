@@ -770,14 +770,21 @@ class CompFunc:
 
 @dataclass
 class RasterizerState:
+    """Mirrors the Vulkan VKRasterizer field names (depthBias /
+    slopeScaledDepthBias), not the D3D-style depthBiasConstantFactor /
+    depthBiasSlopeFactor -- _get_backend_state() routes rasterizer reads
+    through GetVulkanPipelineState() for VK captures."""
+
     fillMode: FillMode | None = None
     cullMode: CullMode | None = None
     frontCCW: bool | None = None
     depthBiasEnable: bool | None = None
-    depthBiasConstantFactor: float | None = None
+    depthBias: float | None = None
     depthBiasClamp: float | None = None
-    depthBiasSlopeFactor: float | None = None
+    slopeScaledDepthBias: float | None = None
     lineWidth: float | None = None
+    depthClampEnable: bool | None = None
+    rasterizerDiscardEnable: bool | None = None
 
 
 @dataclass

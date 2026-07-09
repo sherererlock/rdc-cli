@@ -276,6 +276,20 @@ def _handle_pipe_push_constants(
     ), True
 
 
+def _get_backend_state(pipe_state: Any, state: "DaemonState") -> Any:
+    """Return backend-specific pipeline state (VK/GL/D3D) when the generic PipeState
+    doesn't expose rasterizer/depthStencil/multisample attributes directly."""
+    if pipe_state.IsCaptureVK():
+        return state.adapter.controller.GetVulkanPipelineState()
+    if pipe_state.IsCaptureD3D11():
+        return state.adapter.controller.GetD3D11PipelineState()
+    if pipe_state.IsCaptureD3D12():
+        return state.adapter.controller.GetD3D12PipelineState()
+    if pipe_state.IsCaptureGL():
+        return state.adapter.controller.GetGLPipelineState()
+    return pipe_state
+
+
 def _handle_pipe_rasterizer(
     request_id: int, params: dict[str, Any], state: DaemonState
 ) -> tuple[dict[str, Any], bool]:
@@ -283,18 +297,22 @@ def _handle_pipe_rasterizer(
         eid, pipe_state = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    rast = getattr(pipe_state, "rasterizer", None)
+    backend = _get_backend_state(pipe_state, state)
+    rast = getattr(backend, "rasterizer", None)
     rast_data: dict[str, Any] = {"eid": eid}
     if rast is not None:
+        # VKRasterizer uses depthBias / slopeScaledDepthBias (not D3D-style names)
         for f in (
             "fillMode",
             "cullMode",
             "frontCCW",
             "depthBiasEnable",
-            "depthBiasConstantFactor",
+            "depthBias",
             "depthBiasClamp",
-            "depthBiasSlopeFactor",
+            "slopeScaledDepthBias",
             "lineWidth",
+            "depthClampEnable",
+            "rasterizerDiscardEnable",
         ):
             v = getattr(rast, f, None)
             if v is not None:
@@ -309,7 +327,8 @@ def _handle_pipe_depth_stencil(
         eid, pipe_state = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    ds = getattr(pipe_state, "depthStencil", None)
+    backend = _get_backend_state(pipe_state, state)
+    ds = getattr(backend, "depthStencil", None)
     ds_data: dict[str, Any] = {"eid": eid}
     if ds is not None:
         for f in (
@@ -334,7 +353,8 @@ def _handle_pipe_msaa(
         eid, pipe_state = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    ms = getattr(pipe_state, "multisample", None)
+    backend = _get_backend_state(pipe_state, state)
+    ms = getattr(backend, "multisample", None)
     ms_data: dict[str, Any] = {"eid": eid}
     if ms is not None:
         for f in ("rasterSamples", "sampleShadingEnable", "minSampleShading", "sampleMask"):
@@ -342,6 +362,31 @@ def _handle_pipe_msaa(
             if v is not None:
                 ms_data[f] = v
     return _result_response(request_id, ms_data), True
+
+
+def _handle_pipe_framebuffer(
+    request_id: int, params: dict[str, Any], state: DaemonState
+) -> tuple[dict[str, Any], bool]:
+    try:
+        eid, pipe_state = require_pipe(params, state, request_id)
+    except PipeError as exc:
+        return exc.response, True
+    data: dict[str, Any] = {"eid": eid}
+    try:
+        targets = pipe_state.GetOutputTargets()
+        color_ids = [int(t.resource) for t in targets if int(t.resource) != 0]
+        data["color0_id"] = color_ids[0] if color_ids else None
+        data["color_ids"] = color_ids
+    except Exception:  # noqa: BLE001
+        data["color0_id"] = None
+        data["color_ids"] = []
+    try:
+        depth = pipe_state.GetDepthTarget()
+        did = int(depth.resource)
+        data["depth_id"] = did if did != 0 else None
+    except Exception:  # noqa: BLE001
+        data["depth_id"] = None
+    return _result_response(request_id, data), True
 
 
 HANDLERS: dict[str, Handler] = {
@@ -358,4 +403,5 @@ HANDLERS: dict[str, Handler] = {
     "pipe_rasterizer": _handle_pipe_rasterizer,
     "pipe_depth_stencil": _handle_pipe_depth_stencil,
     "pipe_msaa": _handle_pipe_msaa,
+    "pipe_framebuffer": _handle_pipe_framebuffer,
 }

@@ -51,6 +51,14 @@ def _make_mock_rd(
     return rd, mock_remote
 
 
+@pytest.fixture(autouse=True)
+def _no_backoff_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_load_remote_replay retries the whole flow up to 4x with a 5/15/30s
+    backoff on failure. Tests exercise deterministic (always-fail) mocks, so
+    without this they'd really sleep up to 50s per failing-path test."""
+    monkeypatch.setattr("rdc.daemon_server.time.sleep", lambda _seconds: None)
+
+
 class TestLoadRemoteReplay:
     def test_no_renderdoc_returns_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("rdc.discover.find_renderdoc", lambda: None)
@@ -143,7 +151,8 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "at step 'download capture'" in err
-        mock_remote.ShutdownConnection.assert_called_once()
+        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
+        assert mock_remote.ShutdownConnection.call_count == 4
 
     def test_open_capture_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         rd, mock_remote = _make_mock_rd(open_capture_result=1)
@@ -155,7 +164,8 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "remote OpenCapture failed" in err
-        mock_remote.ShutdownConnection.assert_called_once()
+        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
+        assert mock_remote.ShutdownConnection.call_count == 4
 
     def test_local_openfile_fails(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         rd, mock_remote = _make_mock_rd(open_file_result=1)
@@ -167,8 +177,9 @@ class TestLoadRemoteReplay:
         err = _load_remote_replay(state, "host:39920")
         assert err is not None
         assert "local OpenFile (metadata) failed" in err
-        mock_remote.CloseCapture.assert_called_once()
-        mock_remote.ShutdownConnection.assert_called_once()
+        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
+        assert mock_remote.CloseCapture.call_count == 4
+        assert mock_remote.ShutdownConnection.call_count == 4
 
     def test_success_sets_state_fields(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -209,7 +220,8 @@ class TestLoadRemoteReplayStepLabels:
         assert err is not None
         assert "at step 'upload capture'" in err
         assert "upload bang" in err
-        mock_remote.ShutdownConnection.assert_called_once()
+        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
+        assert mock_remote.ShutdownConnection.call_count == 4
 
     def test_upload_capture_os_error_step_label(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -351,7 +363,8 @@ class TestLoadRemoteReplayStepLabels:
         assert "at step 'init adapter state'" in err
         assert "ValueError" in err
         assert "adapter bang" in err
-        mock_remote.ShutdownConnection.assert_called_once()
+        # Deterministic failure -- retried 4x (whole-flow retry with backoff)
+        assert mock_remote.ShutdownConnection.call_count == 4
 
 
 class TestLoadReplayRegressionB39:

@@ -41,6 +41,14 @@ def _make_state(tmp_path: Path, pipe: MockPipeState) -> DaemonState:
         SetFrameEvent=lambda eid, force: None,
         GetStructuredFile=lambda: SimpleNamespace(chunks=[]),
         GetPipelineState=lambda: pipe,
+        # MockPipeState.IsCaptureVK() defaults to True; _get_backend_state()
+        # routes rasterizer/depthStencil/multisample lookups through these.
+        # This mock keeps that state directly on `pipe`, so all four just
+        # hand back the same object.
+        GetVulkanPipelineState=lambda: pipe,
+        GetD3D11PipelineState=lambda: pipe,
+        GetD3D12PipelineState=lambda: pipe,
+        GetGLPipelineState=lambda: pipe,
         GetTextures=lambda: [],
         GetBuffers=lambda: [],
         GetDebugMessages=lambda: [],

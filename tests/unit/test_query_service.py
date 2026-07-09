@@ -356,8 +356,8 @@ class TestFilterByPassEidRange:
         actions = _build_eid_range_tree()
         flat = walk_actions(actions)
         draws = [a for a in flat if a.flags & 0x0002]
-        # _build_pass_list produces "Colour Pass #1 (1 Target)" for single-color markerless pass
-        result = filter_by_pass(draws, "Colour Pass #1 (1 Target)", actions=actions)
+        # _build_pass_list produces "Colour Pass #1 (1 Targets)" for single-color markerless pass
+        result = filter_by_pass(draws, "Colour Pass #1 (1 Targets)", actions=actions)
         assert len(result) == 3
         assert {a.eid for a in result} == {5, 7, 9}
 
@@ -403,7 +403,7 @@ class TestFilterByPassEidRange:
 
 class TestFriendlyPassName:
     def test_single_color_no_depth(self) -> None:
-        assert _friendly_pass_name("vkCmdBeginRenderPass(C=Load)", 0) == "Colour Pass #1 (1 Target)"
+        assert _friendly_pass_name("vkCmdBeginRenderPass(C=Load)", 0) == "Colour Pass #1 (1 Targets)"
 
     def test_multi_color_with_depth(self) -> None:
         assert (
@@ -438,7 +438,7 @@ class TestBuildPassListFriendlyNames:
         )
         passes = _build_pass_list([begin, draw, end])
         assert len(passes) == 1
-        assert passes[0]["name"] == "Colour Pass #1 (1 Target + Depth)"
+        assert passes[0]["name"] == "Colour Pass #1 (1 Targets + Depth)"
         assert not passes[0]["name"].startswith("vkCmd")
 
     def test_friendly_name_children_no_markers(self) -> None:
@@ -503,8 +503,8 @@ class TestBuildPassListFriendlyNames:
         )
         passes = _build_pass_list(actions)
         assert len(passes) == 2
-        assert passes[0]["name"] == "Colour Pass #1 (1 Target)"
-        assert passes[1]["name"] == "Colour Pass #2 (1 Target)"
+        assert passes[0]["name"] == "Colour Pass #1 (1 Targets)"
+        assert passes[1]["name"] == "Colour Pass #2 (1 Targets)"
 
 
 # ---------------------------------------------------------------------------

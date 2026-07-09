@@ -221,6 +221,37 @@ def _handle_passes(
     return _result_response(request_id, {"tree": tree}), True
 
 
+def _rewrite_pass_suffix(detail: dict[str, Any]) -> None:
+    """Rewrite pass name suffix using actual target counts (matching GUI)."""
+    name = detail.get("name", "")
+    n_color = len(detail.get("color_targets") or [])
+    has_depth = detail.get("depth_target") is not None
+    if name.startswith("Depth-only Pass"):
+        if n_color > 0:
+            m = re.search(r"#(\d+)", name)
+            num = m.group(1) if m else "0"
+            parts: list[str] = [f"{n_color} Targets"]
+            if has_depth:
+                parts.append("Depth")
+            detail["name"] = f"Colour Pass #{num} ({' + '.join(parts)})"
+        return
+    if not name.startswith("Colour Pass"):
+        return
+    if n_color == 0 and has_depth:
+        m = re.search(r"#(\d+)", name)
+        num = m.group(1) if m else "0"
+        detail["name"] = f"Depth-only Pass #{num}"
+        return
+    parts2: list[str] = []
+    if n_color:
+        parts2.append(f"{n_color} Targets")
+    if has_depth:
+        parts2.append("Depth")
+    suffix = f" ({' + '.join(parts2)})" if parts2 else ""
+    prefix = name.split("(")[0].rstrip() if "(" in name else name
+    detail["name"] = f"{prefix}{suffix}"
+
+
 def _handle_pass(
     request_id: int, params: dict[str, Any], state: DaemonState
 ) -> tuple[dict[str, Any], bool]:
@@ -257,6 +288,7 @@ def _handle_pass(
     else:
         detail["color_targets"] = []
         detail["depth_target"] = None
+    _rewrite_pass_suffix(detail)
     return _result_response(request_id, detail), True
 
 

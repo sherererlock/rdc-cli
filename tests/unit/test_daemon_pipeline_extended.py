@@ -62,6 +62,14 @@ def _make_state(tmp_path: Path, pipe: MockPipeState) -> DaemonState:
         SetFrameEvent=lambda eid, force: None,
         GetStructuredFile=lambda: SimpleNamespace(chunks=[]),
         GetPipelineState=lambda: pipe,
+        # MockPipeState.IsCaptureVK() defaults to True; _get_backend_state()
+        # routes rasterizer/depthStencil/multisample lookups through these.
+        # This mock keeps that state directly on `pipe`, so all four just
+        # hand back the same object.
+        GetVulkanPipelineState=lambda: pipe,
+        GetD3D11PipelineState=lambda: pipe,
+        GetD3D12PipelineState=lambda: pipe,
+        GetGLPipelineState=lambda: pipe,
         GetTextures=lambda: [],
         GetBuffers=lambda: [],
         GetDebugMessages=lambda: [],
@@ -312,9 +320,9 @@ class TestPipeRasterizer:
         pipe = MockPipeState()
         pipe.rasterizer = RasterizerState(
             depthBiasEnable=True,
-            depthBiasConstantFactor=2.0,
+            depthBias=2.0,
             depthBiasClamp=0.5,
-            depthBiasSlopeFactor=1.5,
+            slopeScaledDepthBias=1.5,
         )
         s = _make_state(tmp_path, pipe)
         resp, _ = _handle_request(
@@ -322,9 +330,9 @@ class TestPipeRasterizer:
         )
         r = resp["result"]
         assert r["depthBiasEnable"] is True
-        assert r["depthBiasConstantFactor"] == 2.0
+        assert r["depthBias"] == 2.0
         assert r["depthBiasClamp"] == 0.5
-        assert r["depthBiasSlopeFactor"] == 1.5
+        assert r["slopeScaledDepthBias"] == 1.5
 
 
 # ── pipe_depth_stencil ────────────────────────────────────────────────────────

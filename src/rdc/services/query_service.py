@@ -361,35 +361,70 @@ def pipeline_row(
     return row
 
 
+_SKIP_DESC_TYPES = frozenset({"Sampler", "UniformBuffer", "ConstantBuffer"})
+
+
 def bindings_rows(eid: int, pipe_state: Any) -> list[dict[str, Any]]:
     """Get descriptor binding rows for all shader stages."""
     rows: list[dict[str, Any]] = []
+
+    # Build runtime resource_id lookup from GetAllUsedDescriptors.
+    # Key: (stage_int, slot_index) -> resource_id. Excludes samplers/CBVs.
+    desc_map: dict[tuple[int, int], int] = {}
+    # Sorted (acc_index, rid) per stage for positional fallback (OpenGL-style).
+    desc_ordered: dict[int, list[tuple[int, int]]] = {}
+    if hasattr(pipe_state, "GetAllUsedDescriptors"):
+        try:
+            stage_acc: dict[int, dict[int, int]] = {}
+            for ud in pipe_state.GetAllUsedDescriptors(True):
+                acc = ud.access
+                desc = ud.descriptor
+                if getattr(acc.type, "name", str(acc.type)) in _SKIP_DESC_TYPES:
+                    continue
+                rid = int(desc.resource)
+                if rid != 0:
+                    si = int(acc.stage)
+                    stage_acc.setdefault(si, {})[int(acc.index)] = rid
+            for si, slots in stage_acc.items():
+                for idx, rid in slots.items():
+                    desc_map[(si, idx)] = rid
+                desc_ordered[si] = sorted(slots.items())
+        except Exception:  # noqa: BLE001
+            pass
+
     for stage_name, stage_val in STAGE_MAP.items():
         refl = pipe_state.GetShaderReflection(stage_val)
         if refl is None:
             continue
-        for r in getattr(refl, "readOnlyResources", []):
-            rows.append(
-                {
-                    "eid": eid,
-                    "stage": stage_name,
-                    "kind": "ro",
-                    "set": getattr(r, "fixedBindSetOrSpace", 0),
-                    "slot": getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)),
-                    "name": r.name,
-                }
-            )
-        for r in getattr(refl, "readWriteResources", []):
-            rows.append(
-                {
-                    "eid": eid,
-                    "stage": stage_name,
-                    "kind": "rw",
-                    "set": getattr(r, "fixedBindSetOrSpace", 0),
-                    "slot": getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)),
-                    "name": r.name,
-                }
-            )
+        ordered = desc_ordered.get(stage_val, [])
+        for resources, kind in (
+            (getattr(refl, "readOnlyResources", []), "ro"),
+            (getattr(refl, "readWriteResources", []), "rw"),
+        ):
+            bind_nums = [getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)) for r in resources]
+            # OpenGL: fixedBindNumber is 0 for all samplers when glUniform1i assigns
+            # texture units rather than layout(binding=N). Positional matching against
+            # GetAllUsedDescriptors (sorted by acc.index = texture unit) recovers
+            # the correct per-slot resource.
+            positional = len(bind_nums) > 1 and len(set(bind_nums)) == 1
+            for i, r in enumerate(resources):
+                if positional and i < len(ordered):
+                    acc_idx, rid = ordered[i]
+                    slot = acc_idx
+                else:
+                    slot = bind_nums[i] if i < len(bind_nums) else 0
+                    rid = desc_map.get((stage_val, slot), 0)
+                rows.append(
+                    {
+                        "eid": eid,
+                        "stage": stage_name,
+                        "kind": kind,
+                        "set": getattr(r, "fixedBindSetOrSpace", 0),
+                        "slot": slot,
+                        "name": r.name,
+                        "resource_id": rid or "",
+                    }
+                )
     return rows
 
 
@@ -528,7 +563,7 @@ def _friendly_pass_name(api_name: str, index: int) -> str:
     has_depth = "D=" in api_name
     parts = []
     if color_count:
-        parts.append(f"{color_count} Target{'s' if color_count > 1 else ''}")
+        parts.append(f"{color_count} Targets")
     if has_depth:
         parts.append("Depth")
     if not parts and "(" in api_name:
@@ -693,7 +728,7 @@ def _friendly_rt_name(rt_key: tuple[int, ...], index: int) -> str:
     parts: list[str] = []
     if non_zero:
         n = len(non_zero)
-        parts.append(f"{n} Target{'s' if n > 1 else ''}")
+        parts.append(f"{n} Targets")
     if has_depth:
         parts.append("Depth")
     suffix = f" ({' + '.join(parts)})" if parts else ""
@@ -774,13 +809,64 @@ def _build_synthetic_pass_list(actions: list[Any], sf: Any = None) -> list[dict[
     return passes
 
 
+_AUTO_PASS_NAME_RE = re.compile(r"^Colour Pass #\d+")
+
+
+def _renumber_passes(passes: list[dict[str, Any]]) -> None:
+    """Renumber auto-named passes per-type to match RenderDoc GUI convention.
+
+    Only touches passes still carrying the default ``_friendly_pass_name`` /
+    ``_friendly_rt_name`` label. Passes named from a debug PushMarker (e.g.
+    "Shadow", "GBuffer") are left untouched -- the marker name is more
+    meaningful than a generic "Colour Pass #N" and must not be clobbered.
+    """
+    counters = {"colour": 0, "compute": 0, "copyclear": 0, "depthonly": 0}
+    for p in passes:
+        name = p.get("name", "")
+        if not _AUTO_PASS_NAME_RE.match(name):
+            continue
+        d = p.get("draws", 0)
+        disp = p.get("dispatches", 0)
+        cop = p.get("copies", 0)
+        clr = p.get("clears", 0)
+
+        if d == 0 and disp > 0 and cop == 0 and clr == 0:
+            cat = "compute"
+        elif d == 0 and disp == 0 and (cop > 0 or clr > 0):
+            cat = "copyclear"
+        else:
+            suffix = ""
+            if "(" in name:
+                suffix = name[name.index("("):]
+            if suffix.strip("() ") == "Depth":
+                cat = "depthonly"
+            else:
+                cat = "colour"
+        counters[cat] += 1
+
+        if cat == "compute":
+            p["name"] = f"Compute Pass #{counters[cat]}"
+        elif cat == "copyclear":
+            p["name"] = f"Copy/Clear Pass #{counters[cat]}"
+        elif cat == "depthonly":
+            p["name"] = f"Depth-only Pass #{counters[cat]}"
+        else:
+            suffix = ""
+            if "(" in name:
+                suffix = " " + name[name.index("("):]
+            p["name"] = f"Colour Pass #{counters[cat]}{suffix}"
+
+
 def _pass_list_with_fallback(actions: list[Any], sf: Any = None) -> list[dict[str, Any]]:
     """Build pass list, merging explicit passes with gap-filling synthetic passes."""
     explicit = _build_pass_list(actions, sf)
     if not explicit:
-        return _build_synthetic_pass_list(actions, sf)
+        result = _build_synthetic_pass_list(actions, sf)
+        _renumber_passes(result)
+        return result
     synthetic = _build_synthetic_pass_list(actions, sf)
     if not synthetic:
+        _renumber_passes(explicit)
         return explicit
     # Keep synthetic passes whose EID range doesn't overlap any explicit pass
     gap_fills = [
@@ -791,9 +877,11 @@ def _pass_list_with_fallback(actions: list[Any], sf: Any = None) -> list[dict[st
         )
     ]
     if not gap_fills:
+        _renumber_passes(explicit)
         return explicit
     merged = explicit + gap_fills
     merged.sort(key=lambda p: p["begin_eid"])
+    _renumber_passes(merged)
     return merged
 
 

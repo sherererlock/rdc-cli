@@ -16,7 +16,7 @@ class TestFriendlyPassNameClearFormat:
 
     def test_cd_format_unchanged(self) -> None:
         result = _friendly_pass_name("vkCmdBeginRenderPass(C=Clear, D=Clear)", 0)
-        assert result == "Colour Pass #1 (1 Target + Depth)"
+        assert result == "Colour Pass #1 (1 Targets + Depth)"
 
     def test_multi_target_unchanged(self) -> None:
         result = _friendly_pass_name("vkCmdBeginRenderPass(C=Clear, C=Load, D=Clear)", 2)
