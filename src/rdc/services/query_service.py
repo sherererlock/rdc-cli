@@ -365,30 +365,33 @@ _SKIP_DESC_TYPES = frozenset({"Sampler", "UniformBuffer", "ConstantBuffer"})
 
 
 def bindings_rows(eid: int, pipe_state: Any) -> list[dict[str, Any]]:
-    """Get descriptor binding rows for all shader stages."""
+    """Get descriptor binding rows for all shader stages.
+
+    ``DescriptorAccess.index`` is documented by renderdoc as the position of
+    that descriptor within its *own* reflection list (readOnlyResources /
+    readWriteResources for the stage) -- not the declared ``fixedBindNumber``.
+    Resources must therefore be looked up as ``reflection_list[access.index]``;
+    joining ``access.index`` against ``fixedBindNumber`` is wrong whenever bind
+    numbers don't start at 0 and run contiguously (see descriptor.py's
+    ``_resolve_binding``, which uses the same correlation and is known-correct).
+    """
     rows: list[dict[str, Any]] = []
 
-    # Build runtime resource_id lookup from GetAllUsedDescriptors.
-    # Key: (stage_int, slot_index) -> resource_id. Excludes samplers/CBVs.
-    desc_map: dict[tuple[int, int], int] = {}
-    # Sorted (acc_index, rid) per stage for positional fallback (OpenGL-style).
-    desc_ordered: dict[int, list[tuple[int, int]]] = {}
+    # (stage_int, kind) -> {reflection_index: resource_id}. Excludes samplers/CBVs.
+    desc_by_index: dict[tuple[int, str], dict[int, int]] = {}
     if hasattr(pipe_state, "GetAllUsedDescriptors"):
         try:
-            stage_acc: dict[int, dict[int, int]] = {}
             for ud in pipe_state.GetAllUsedDescriptors(True):
                 acc = ud.access
                 desc = ud.descriptor
-                if getattr(acc.type, "name", str(acc.type)) in _SKIP_DESC_TYPES:
+                type_name = getattr(acc.type, "name", str(acc.type))
+                if type_name in _SKIP_DESC_TYPES:
                     continue
                 rid = int(desc.resource)
-                if rid != 0:
-                    si = int(acc.stage)
-                    stage_acc.setdefault(si, {})[int(acc.index)] = rid
-            for si, slots in stage_acc.items():
-                for idx, rid in slots.items():
-                    desc_map[(si, idx)] = rid
-                desc_ordered[si] = sorted(slots.items())
+                if rid == 0:
+                    continue
+                kind = "rw" if type_name.startswith("ReadWrite") else "ro"
+                desc_by_index.setdefault((int(acc.stage), kind), {})[int(acc.index)] = rid
         except Exception:  # noqa: BLE001
             pass
 
@@ -396,33 +399,21 @@ def bindings_rows(eid: int, pipe_state: Any) -> list[dict[str, Any]]:
         refl = pipe_state.GetShaderReflection(stage_val)
         if refl is None:
             continue
-        ordered = desc_ordered.get(stage_val, [])
         for resources, kind in (
             (getattr(refl, "readOnlyResources", []), "ro"),
             (getattr(refl, "readWriteResources", []), "rw"),
         ):
-            bind_nums = [getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)) for r in resources]
-            # OpenGL: fixedBindNumber is 0 for all samplers when glUniform1i assigns
-            # texture units rather than layout(binding=N). Positional matching against
-            # GetAllUsedDescriptors (sorted by acc.index = texture unit) recovers
-            # the correct per-slot resource.
-            positional = len(bind_nums) > 1 and len(set(bind_nums)) == 1
+            index_map = desc_by_index.get((stage_val, kind), {})
             for i, r in enumerate(resources):
-                if positional and i < len(ordered):
-                    acc_idx, rid = ordered[i]
-                    slot = acc_idx
-                else:
-                    slot = bind_nums[i] if i < len(bind_nums) else 0
-                    rid = desc_map.get((stage_val, slot), 0)
                 rows.append(
                     {
                         "eid": eid,
                         "stage": stage_name,
                         "kind": kind,
                         "set": getattr(r, "fixedBindSetOrSpace", 0),
-                        "slot": slot,
+                        "slot": getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)),
                         "name": r.name,
-                        "resource_id": rid or "",
+                        "resource_id": index_map.get(i, 0) or "",
                     }
                 )
     return rows
