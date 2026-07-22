@@ -10,6 +10,7 @@ from rdc.handlers._helpers import (
     _error_response,
     _result_response,
     require_pipe,
+    resolve_color_targets,
 )
 from rdc.handlers._types import Handler
 
@@ -87,17 +88,15 @@ def _handle_pixel_history(
         eid, pipe = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    targets = pipe.GetOutputTargets()
-    non_null = [(i, t) for i, t in enumerate(targets) if int(t.resource) != 0]
+    color_targets = resolve_color_targets(pipe, state)
 
-    if not non_null:
+    if not color_targets:
         return _error_response(request_id, -32001, f"no color targets at eid {eid}"), True
 
-    match = [t for i, t in non_null if i == target_idx]
-    if not match:
+    if not 0 <= target_idx < len(color_targets):
         return _error_response(request_id, -32001, f"target index {target_idx} out of range"), True
 
-    rt_rid = match[0].resource
+    rt_rid = color_targets[target_idx]
     tex = state.tex_map.get(int(rt_rid))
     if tex is not None and getattr(tex, "msSamp", 1) > 1:
         return _error_response(request_id, -32001, "MSAA pixel history not supported"), True
@@ -153,17 +152,15 @@ def _handle_pick_pixel(
         eid, pipe = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    targets = pipe.GetOutputTargets()
-    non_null = [(i, t) for i, t in enumerate(targets) if int(t.resource) != 0]
+    color_targets = resolve_color_targets(pipe, state)
 
-    if not non_null:
+    if not color_targets:
         return _error_response(request_id, -32001, f"no color targets at eid {eid}"), True
 
-    match = [t for i, t in non_null if i == target_idx]
-    if not match:
+    if not 0 <= target_idx < len(color_targets):
         return _error_response(request_id, -32001, f"target index {target_idx} out of range"), True
 
-    rt_rid = match[0].resource
+    rt_rid = color_targets[target_idx]
     tex = state.tex_map.get(int(rt_rid))
     if tex is not None and getattr(tex, "msSamp", 1) > 1:
         return _error_response(request_id, -32001, "MSAA pick-pixel not supported"), True

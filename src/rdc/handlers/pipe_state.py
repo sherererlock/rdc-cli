@@ -14,6 +14,8 @@ from rdc.handlers._helpers import (
     _sanitize_size,
     get_pipeline_for_stage,
     require_pipe,
+    resolve_color_targets,
+    resolve_depth_target,
 )
 from rdc.handlers._types import Handler
 
@@ -276,7 +278,7 @@ def _handle_pipe_push_constants(
     ), True
 
 
-def _get_backend_state(pipe_state: Any, state: "DaemonState") -> Any:
+def _get_backend_state(pipe_state: Any, state: DaemonState) -> Any:
     """Return backend-specific pipeline state (VK/GL/D3D) when the generic PipeState
     doesn't expose rasterizer/depthStencil/multisample attributes directly."""
     if pipe_state.IsCaptureVK():
@@ -372,20 +374,11 @@ def _handle_pipe_framebuffer(
     except PipeError as exc:
         return exc.response, True
     data: dict[str, Any] = {"eid": eid}
-    try:
-        targets = pipe_state.GetOutputTargets()
-        color_ids = [int(t.resource) for t in targets if int(t.resource) != 0]
-        data["color0_id"] = color_ids[0] if color_ids else None
-        data["color_ids"] = color_ids
-    except Exception:  # noqa: BLE001
-        data["color0_id"] = None
-        data["color_ids"] = []
-    try:
-        depth = pipe_state.GetDepthTarget()
-        did = int(depth.resource)
-        data["depth_id"] = did if did != 0 else None
-    except Exception:  # noqa: BLE001
-        data["depth_id"] = None
+    color_targets = resolve_color_targets(pipe_state, state)
+    data["color0_id"] = int(color_targets[0]) if color_targets else None
+    data["color_ids"] = [int(r) for r in color_targets]
+    depth = resolve_depth_target(pipe_state, state)
+    data["depth_id"] = int(depth) if depth is not None and int(depth) != 0 else None
     return _result_response(request_id, data), True
 
 

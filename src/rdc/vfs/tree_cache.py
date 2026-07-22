@@ -250,6 +250,8 @@ def populate_draw_subtree(
     tree: VfsTree,
     eid: int,
     pipe_state: Any,
+    color_targets: list[Any] | None = None,
+    depth_target: Any = None,
 ) -> dict[str, list[str]]:
     """Discover active shader stages and populate draw subtree nodes.
 
@@ -257,6 +259,12 @@ def populate_draw_subtree(
         tree: The VFS tree to update.
         eid: Draw event ID.
         pipe_state: Pipeline state object with GetShader().
+        color_targets: Pre-resolved color target resources (see
+            handlers._helpers.resolve_color_targets). Falls back to
+            ``pipe_state.GetOutputTargets()`` when omitted.
+        depth_target: Pre-resolved depth target resource (see
+            handlers._helpers.resolve_depth_target). Falls back to
+            ``pipe_state.GetDepthTarget()`` when omitted.
 
     Returns:
         Mapping of path -> child names for the populated subtree.
@@ -289,14 +297,17 @@ def populate_draw_subtree(
     # Populate targets subtree
     targets_path = f"{prefix}/targets"
     target_children: list[str] = []
-    for i, t in enumerate(pipe_state.GetOutputTargets()):
-        if int(t.resource) != 0:
+    if color_targets is None:
+        color_targets = [t.resource for t in pipe_state.GetOutputTargets() if int(t.resource) != 0]
+    for i, resource in enumerate(color_targets):
+        if int(resource) != 0:
             name = f"color{i}.png"
             target_children.append(name)
             tree.static[f"{targets_path}/{name}"] = VfsNode(name, "leaf_bin")
 
-    depth = pipe_state.GetDepthTarget()
-    if int(depth.resource) != 0:
+    if depth_target is None:
+        depth_target = pipe_state.GetDepthTarget().resource
+    if depth_target is not None and int(depth_target) != 0:
         target_children.append("depth.png")
         tree.static[f"{targets_path}/depth.png"] = VfsNode("depth.png", "leaf_bin")
 
@@ -386,6 +397,8 @@ def populate_pass_attachments(
     tree: VfsTree,
     pass_name: str,
     pipe_state: Any,
+    color_targets: list[Any] | None = None,
+    depth_target: Any = None,
 ) -> None:
     """Populate /passes/<name>/attachments/ with color and depth leaves."""
     prefix = f"/passes/{pass_name}/attachments"
@@ -393,15 +406,17 @@ def populate_pass_attachments(
     if node is None or node.children:
         return
 
+    if color_targets is None:
+        color_targets = [t.resource for t in pipe_state.GetOutputTargets() if int(t.resource) != 0]
     children: list[str] = []
-    for i, t in enumerate(pipe_state.GetOutputTargets()):
-        if int(t.resource) != 0:
+    for i, resource in enumerate(color_targets):
+        if int(resource) != 0:
             name = f"color{i}"
             children.append(name)
             tree.static[f"{prefix}/{name}"] = VfsNode(name, "leaf")
 
-    depth = pipe_state.GetDepthTarget()
-    if int(depth.resource) != 0:
+    depth = depth_target if depth_target is not None else pipe_state.GetDepthTarget().resource
+    if depth is not None and int(depth) != 0:
         children.append("depth")
         tree.static[f"{prefix}/depth"] = VfsNode("depth", "leaf")
 

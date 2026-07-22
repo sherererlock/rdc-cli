@@ -148,6 +148,7 @@ class DaemonState:
     local_capture_is_temp: bool = False
     _ping_stop: Any = None
     _ping_thread: Any = None
+    remote_dead: bool = False
 
 
 def _detect_version(rd: Any) -> tuple[int, int]:
@@ -473,7 +474,8 @@ def _start_ping_thread(state: DaemonState) -> None:
                 if state.remote is not None:
                     state.remote.Ping()
             except Exception:  # noqa: BLE001
-                _log.warning("remote ping failed -- connection may be lost")
+                _log.warning("remote ping failed -- connection lost, marking replay dead")
+                state.remote_dead = True
                 break
 
     t = threading.Thread(target=_ping_loop, daemon=True, name="rdc-remote-ping")

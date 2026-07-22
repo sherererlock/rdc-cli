@@ -14,6 +14,8 @@ from rdc.handlers._helpers import (
     _result_response,
     _set_frame_event,
     require_pipe,
+    resolve_color_targets,
+    resolve_depth_target,
 )
 from rdc.handlers._types import Handler
 
@@ -177,14 +179,12 @@ def _handle_rt_export(
         eid, pipe = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    targets = pipe.GetOutputTargets()
-    non_null = [(i, t) for i, t in enumerate(targets) if int(t.resource) != 0]
-    if not non_null:
+    color_targets = resolve_color_targets(pipe, state)
+    if not color_targets:
         return _error_response(request_id, -32001, f"no color targets at eid {eid}"), True
-    match = [t for i, t in non_null if i == target_idx]
-    if not match:
+    if not 0 <= target_idx < len(color_targets):
         return _error_response(request_id, -32001, f"target index {target_idx} out of range"), True
-    resource = match[0].resource
+    resource = color_targets[target_idx]
     temp_path = state.temp_dir / f"rt_{eid}_color{target_idx}.png"
     if state.is_remote:
         tex = state.tex_map.get(int(resource))
@@ -212,22 +212,20 @@ def _handle_rt_depth(
         eid, pipe = require_pipe(params, state, request_id)
     except PipeError as exc:
         return exc.response, True
-    depth = pipe.GetDepthTarget()
-    if int(depth.resource) == 0:
+    depth = resolve_depth_target(pipe, state)
+    if depth is None or int(depth) == 0:
         return _error_response(request_id, -32001, f"no depth target at eid {eid}"), True
     temp_path = state.temp_dir / f"rt_{eid}_depth.png"
-    tex = state.tex_map.get(int(depth.resource))
+    tex = state.tex_map.get(int(depth))
     if tex is None:
         return _error_response(
-            request_id, -32001, f"depth target {int(depth.resource)} not found"
+            request_id, -32001, f"depth target {int(depth)} not found"
         ), True
-    resp, running = _export_remote(
-        request_id, state, tex, depth.resource, temp_path, 0, is_depth=True
-    )
+    resp, running = _export_remote(request_id, state, tex, depth, temp_path, 0, is_depth=True)
     # Combined depth-stencil and MSAA formats decode to None (-32002). Locally,
     # SaveTexture can still export them (RGBA); remote returns the error as-is.
     if resp.get("error", {}).get("code") == -32002 and not state.is_remote:
-        texsave = _make_texsave(state.rd, depth.resource)
+        texsave = _make_texsave(state.rd, depth)
         success = state.adapter.controller.SaveTexture(texsave, str(temp_path))  # type: ignore[union-attr]
         if not success or not temp_path.exists():
             return _error_response(request_id, -32002, "SaveTexture failed"), True

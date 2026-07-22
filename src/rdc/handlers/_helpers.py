@@ -86,12 +86,17 @@ def _max_eid(actions: list[Any]) -> int:
     return result
 
 
+_REMOTE_DEAD_MSG = "remote replay connection lost -- run 'rdc close' then 'rdc open' again"
+
+
 def _set_frame_event(state: DaemonState, eid: int) -> str | None:
     """Set frame event with caching. Returns error string or None."""
     if eid < 0:
         return "eid must be >= 0"
     if state.max_eid > 0 and eid > state.max_eid:
         return f"eid {eid} out of range (max: {state.max_eid})"
+    if getattr(state, "is_remote", False) and getattr(state, "remote_dead", False):
+        return _REMOTE_DEAD_MSG
     if state.adapter is not None:
         if state._eid_cache != eid:
             state.adapter.set_frame_event(eid)
@@ -106,6 +111,8 @@ def _seek_replay(state: DaemonState, eid: int) -> str | None:
         return "eid must be >= 0"
     if state.max_eid > 0 and eid > state.max_eid:
         return f"eid {eid} out of range (max: {state.max_eid})"
+    if getattr(state, "is_remote", False) and getattr(state, "remote_dead", False):
+        return _REMOTE_DEAD_MSG
     if state.adapter is not None and state._eid_cache != eid:
         state.adapter.set_frame_event(eid)
         state._eid_cache = eid
@@ -489,6 +496,59 @@ def require_pipe(params: dict[str, Any], state: DaemonState, request_id: int) ->
     return eid, pipe_state
 
 
+def _vk_framebuffer_attachments(pipe_state: Any, state: DaemonState) -> tuple[list[Any], Any]:
+    """Return (colorAttachment resources, depthstencil resource) from the VK-specific
+    current render pass, or ([], None) if unavailable/dynamic-rendering/non-VK.
+
+    Some VK captures leave the generic PipeState facade's GetOutputTargets()/
+    GetDepthTarget() empty for a traditional (non-dynamic) render-pass-bound
+    framebuffer even though real attachments are bound; the VK-specific state
+    resolves them correctly via currentPass.renderpass/framebuffer.
+    """
+    if not pipe_state.IsCaptureVK() or state.adapter is None:
+        return [], None
+    try:
+        vk = state.adapter.controller.GetVulkanPipelineState()
+        cp = vk.currentPass
+        rp = cp.renderpass
+        if bool(getattr(rp, "dynamic", False)):
+            return [], None
+        attachments = list(getattr(cp.framebuffer, "attachments", []))
+        unused = getattr(rp, "AttachmentUnused", 0xFFFFFFFF)
+        color_resources = [
+            attachments[i].resource
+            for i in getattr(rp, "colorAttachments", [])
+            if i != unused and 0 <= i < len(attachments) and int(attachments[i].resource) != 0
+        ]
+        ds_idx = getattr(rp, "depthstencilAttachment", unused)
+        depth_resource = (
+            attachments[ds_idx].resource
+            if ds_idx != unused and 0 <= ds_idx < len(attachments)
+            else None
+        )
+        return color_resources, depth_resource
+    except Exception:  # noqa: BLE001
+        return [], None
+
+
+def resolve_color_targets(pipe_state: Any, state: DaemonState) -> list[Any]:
+    """Return non-null color target resources, with VK framebuffer fallback."""
+    resources = [t.resource for t in pipe_state.GetOutputTargets() if int(t.resource) != 0]
+    if resources:
+        return resources
+    color_resources, _ = _vk_framebuffer_attachments(pipe_state, state)
+    return color_resources
+
+
+def resolve_depth_target(pipe_state: Any, state: DaemonState) -> Any:
+    """Return the depth target resource, or None. With VK framebuffer fallback."""
+    depth = pipe_state.GetDepthTarget().resource
+    if int(depth) != 0:
+        return depth
+    _, depth_resource = _vk_framebuffer_attachments(pipe_state, state)
+    return depth_resource
+
+
 def get_pipeline_for_stage(pipe_state: Any, stage_val: int) -> Any:
     """Return the correct pipeline object for a shader stage."""
     return (
@@ -621,7 +681,13 @@ def _ensure_shader_populated(
             return _error_response(request_id, -32002, err)
         pipe = state.adapter.get_pipeline_state()  # type: ignore[union-attr]
         assert state.vfs_tree is not None
-        populate_draw_subtree(state.vfs_tree, eid, pipe)
+        populate_draw_subtree(
+            state.vfs_tree,
+            eid,
+            pipe,
+            color_targets=resolve_color_targets(pipe, state),
+            depth_target=resolve_depth_target(pipe, state),
+        )
     return None
 
 
@@ -651,5 +717,11 @@ def _ensure_pass_attachments_populated(
     pipe = state.adapter.get_pipeline_state()  # type: ignore[union-attr]
     from rdc.vfs.tree_cache import populate_pass_attachments
 
-    populate_pass_attachments(state.vfs_tree, pass_name, pipe)
+    populate_pass_attachments(
+        state.vfs_tree,
+        pass_name,
+        pipe,
+        color_targets=resolve_color_targets(pipe, state),
+        depth_target=resolve_depth_target(pipe, state),
+    )
     return None
