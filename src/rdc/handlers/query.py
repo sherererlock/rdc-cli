@@ -279,21 +279,34 @@ def _handle_pass(
     if err is None:
         pipe = state.adapter.get_pipeline_state()
         detail["color_targets"] = [
-            _enrich_target(int(t.resource), state)
+            _enrich_target(int(t.resource), state, t)
             for t in pipe.GetOutputTargets()
             if int(t.resource) != 0
         ]
-        depth_id = int(pipe.GetDepthTarget().resource)
-        detail["depth_target"] = _enrich_target(depth_id, state) if depth_id != 0 else None
+        depth_attach = pipe.GetDepthTarget()
+        depth_id = int(depth_attach.resource)
+        detail["depth_target"] = (
+            _enrich_target(depth_id, state, depth_attach) if depth_id != 0 else None
+        )
     else:
         detail["color_targets"] = []
         detail["depth_target"] = None
+    # root-cause-5：attach 对象无 loadOp/clear* 属性 → 用结构化文件补
+    # （vkCreateRenderPass load/store ops + vkCmdBeginRenderPass clear values）
+    _fill_sf_attach_info(state, detail, identifier)
     _rewrite_pass_suffix(detail)
     return _result_response(request_id, detail), True
 
 
-def _enrich_target(rid: int, state: DaemonState) -> dict[str, Any]:
-    """Build an enriched attachment dict for a render target resource ID."""
+def _enrich_target(
+    rid: int, state: DaemonState, attach: Any | None = None
+) -> dict[str, Any]:
+    """Build an enriched attachment dict for a render target resource ID.
+
+    ``attach`` is the RenderDoc attachment object (e.g. BoundFramebufferAttachment);
+    its loadOp/storeOp/clear* attributes are copied when present. ``None`` values
+    keep the output stable across API versions that lack these attributes.
+    """
     entry: dict[str, Any] = {"id": rid}
     name = state.res_names.get(rid, "")
     if name:
@@ -305,7 +318,273 @@ def _enrich_target(rid: int, state: DaemonState) -> dict[str, Any]:
             entry["format"] = fmt.Name()
         entry["width"] = tex.width
         entry["height"] = tex.height
+    if attach is None:
+        return entry
+    entry["load_op"] = _enum_name(getattr(attach, "loadOp", None))
+    entry["store_op"] = _enum_name(getattr(attach, "storeOp", None))
+    clear_color = getattr(attach, "clearColor", None)
+    if isinstance(clear_color, (list, tuple)):
+        entry["clear_color"] = [float(v) for v in clear_color[:4]]
+    elif clear_color is not None and hasattr(clear_color, "r"):
+        entry["clear_color"] = [clear_color.r, clear_color.g, clear_color.b, clear_color.a]
+    else:
+        entry["clear_color"] = None
+    entry["clear_depth"] = getattr(attach, "clearDepth", None)
+    entry["clear_stencil"] = getattr(attach, "clearStencil", None)
     return entry
+
+
+# ---------------------------------------------------------------------------
+# root-cause-5：renderpass load/store/clear 值（结构化文件来源，无需重放）
+#
+# BoundFramebufferAttachment（GetOutputTargets 返回项）没有 loadOp/storeOp/
+# clear* 属性（RenderDoc API 限制，Vulkan 下同样拿不到）。可靠来源是
+# capture 的结构化文件（OpenFile 时本地解析，本地/远程重放都可用）：
+#   - vkCreateRenderPass.pAttachments[i].loadOp/storeOp/stencilLoadOp/stencilStoreOp
+#   - vkCmdBeginRenderPass.RenderPassBegin.pClearValues[i]（color/depthStencil）
+#   - 映射：pass 附件 rid 列表（color_targets[].id + depth_target.id）==
+#     vkCreateFramebuffer.pAttachments（AsResourceId，顺序一致）
+# ---------------------------------------------------------------------------
+from typing import Any as _Any
+
+# sf 对象不可哈希（mock dataclass 与部分 swig 对象），用 id(sf) 做键并持有
+# 引用防 id 复用；同一 daemon 会话内 structured file 固定不变。
+_SF_RP_INDEX_CACHE: dict[int, tuple[_Any, tuple]] = {}
+
+
+def _sf_find(ch, name: str, depth: int = 0):
+    """Recursively find a child chunk by name. Defensive; returns None on any error."""
+    if ch is None or depth > 8:
+        return None
+    try:
+        if ch.name == name:
+            return ch
+        for i in range(ch.NumChildren()):
+            found = _sf_find(ch.GetChild(i), name, depth + 1)
+            if found is not None:
+                return found
+    except Exception:
+        pass
+    return None
+
+
+def _sf_text(ch) -> str | None:
+    if ch is None:
+        return None
+    try:
+        return ch.AsString()
+    except Exception:
+        return None
+
+
+def _vk_attach_op(s) -> str | None:
+    """VK_ATTACHMENT_LOAD_OP_CLEAR → 'Clear'; ..._LOAD → 'Load'; ..._DONT_CARE → 'DontCare'."""
+    if not isinstance(s, str):
+        return None
+    u = s.upper()
+    if u.endswith("_DONT_CARE"):
+        return "DontCare"
+    for op in ("CLEAR", "LOAD", "STORE", "RESOLVE", "NONE", "UNDEFINED"):
+        if u.endswith("_" + op):
+            return op.title()
+    return None
+
+
+def _sf_renderpass_index(sf) -> tuple[dict, dict, list]:
+    """Build renderpass attachment info from the structured file.
+
+    Returns ``(fbs, rps, begins)``:
+      - ``fbs``:    {framebuffer rid: [attachment resource ids]}  -- vkCreateFramebuffer
+      - ``rps``:    {renderpass rid: {slot: {"load_op", "store_op",
+                    "stencil_load_op", "stencil_store_op"}}}      -- vkCreateRenderPass
+      - ``begins``: [(fb_rid, rp_rid, [clear dicts per slot])]    -- vkCmdBeginRenderPass,
+                    in execution order; clear dicts carry "clear_color"/"clear_depth"/
+                    "clear_stencil" when present.
+    """
+    _key = id(sf)
+    _hit = _SF_RP_INDEX_CACHE.get(_key)
+    if _hit is not None and _hit[0] is sf:
+        return _hit[1]
+    fbs: dict[int, list[int]] = {}
+    rps: dict[int, dict[int, dict[str, str | None]]] = {}
+    begins: list[tuple[int, int, list[dict]]] = []
+    view_to_image: dict[int, int] = {}
+    # 第一遍：view → image 映射（vkCreateFramebuffer 的 pAttachments 是 view 句柄）
+    for chunk in sf.chunks:
+        try:
+            if chunk.name != "vkCreateImageView":
+                continue
+            ci = _sf_find(chunk, "CreateInfo")
+            img = _sf_find(ci, "image") if ci else None
+            view = _sf_find(chunk, "View")
+            vrid = int(view.AsResourceId()) if view is not None else -1
+            irid = int(img.AsResourceId()) if img is not None else -1
+            if vrid >= 0 and irid >= 0:
+                view_to_image[vrid] = irid
+        except Exception:
+            pass
+    for chunk in sf.chunks:
+        try:
+            name = chunk.name
+        except Exception:
+            continue
+        if name == "vkCreateFramebuffer":
+            try:
+                ci = _sf_find(chunk, "CreateInfo")
+                fb = _sf_find(chunk, "Framebuffer")
+                atts = _sf_find(ci, "pAttachments") if ci else None
+                fb_rid = int(fb.AsResourceId()) if fb is not None else -1
+                # pAttachments 是 VkImageView 句柄 → 映射到 image rid
+                #（GetOutputTargets/pass_details 的附件 id 是 image rid）
+                atts_rids = (
+                    [
+                        view_to_image.get(int(atts.GetChild(i).AsResourceId()), int(atts.GetChild(i).AsResourceId()))
+                        for i in range(atts.NumChildren())
+                    ]
+                    if atts is not None
+                    else []
+                )
+                if fb_rid >= 0:
+                    fbs[fb_rid] = atts_rids
+            except Exception:
+                pass
+        elif name == "vkCreateRenderPass":
+            try:
+                ci = _sf_find(chunk, "CreateInfo")
+                rp = _sf_find(chunk, "RenderPass")
+                atts = _sf_find(ci, "pAttachments") if ci else None
+                rp_rid = int(rp.AsResourceId()) if rp is not None else -1
+                ops: dict[int, dict[str, str | None]] = {}
+                if atts is not None:
+                    for i in range(atts.NumChildren()):
+                        a = atts.GetChild(i)
+                        ops[i] = {
+                            "load_op": _vk_attach_op(_sf_text(_sf_find(a, "loadOp"))),
+                            "store_op": _vk_attach_op(_sf_text(_sf_find(a, "storeOp"))),
+                            "stencil_load_op": _vk_attach_op(_sf_text(_sf_find(a, "stencilLoadOp"))),
+                            "stencil_store_op": _vk_attach_op(_sf_text(_sf_find(a, "stencilStoreOp"))),
+                        }
+                if rp_rid >= 0:
+                    rps[rp_rid] = ops
+            except Exception:
+                pass
+        elif name == "vkCmdBeginRenderPass":
+            try:
+                rb = _sf_find(chunk, "RenderPassBegin")
+                fb = _sf_find(rb, "framebuffer") if rb else None
+                rp = _sf_find(rb, "renderPass") if rb else None
+                pv = _sf_find(rb, "pClearValues") if rb else None
+                fb_rid = int(fb.AsResourceId()) if fb is not None else -1
+                rp_rid = int(rp.AsResourceId()) if rp is not None else -1
+                clears: list[dict] = []
+                if pv is not None:
+                    for i in range(pv.NumChildren()):
+                        el = pv.GetChild(i)
+                        color = _sf_find(el, "color")
+                        ds = _sf_find(el, "depthStencil")
+                        entry: dict = {}
+                        if color is not None:
+                            f32 = _sf_find(color, "float32")
+                            if f32 is not None:
+                                entry["clear_color"] = [
+                                    float(f32.GetChild(k).AsFloat())
+                                    for k in range(min(4, f32.NumChildren()))
+                                ]
+                        if ds is not None:
+                            d = _sf_find(ds, "depth")
+                            s = _sf_find(ds, "stencil")
+                            if d is not None:
+                                try:
+                                    entry["clear_depth"] = float(d.AsFloat())
+                                except Exception:
+                                    pass
+                            if s is not None:
+                                try:
+                                    entry["clear_stencil"] = float(s.AsFloat())
+                                except Exception:
+                                    pass
+                        clears.append(entry)
+                begins.append((fb_rid, rp_rid, clears))
+            except Exception:
+                pass
+    _idx = (fbs, rps, begins)
+    _SF_RP_INDEX_CACHE[_key] = (sf, _idx)
+    return fbs, rps, begins
+
+
+def _fill_sf_attach_info(state: DaemonState, detail: dict, identifier: int | str) -> None:
+    """Fill load_op/store_op/clear_* from the structured file into pass detail.
+
+    Only overwrites fields left None by ``_enrich_target`` (attach attributes
+    are absent in every RenderDoc API); keeps analyst/other sources' values.
+    """
+    sf = state.structured_file
+    if sf is None:
+        return
+    color_targets = detail.get("color_targets") or []
+    depth_target = detail.get("depth_target")
+    if not color_targets and not depth_target:
+        return
+    try:
+        fbs, rps, begins = _sf_renderpass_index(sf)
+    except Exception:
+        return
+    att_rids = [c.get("id") for c in color_targets if c.get("id") is not None]
+    if depth_target and depth_target.get("id"):
+        att_rids.append(depth_target["id"])
+    if not att_rids:
+        return
+    fb_rid = None
+    for rid, atts in fbs.items():
+        if atts == att_rids:
+            fb_rid = rid
+            break
+    if fb_rid is None:
+        return
+    fb_begins = [b for b in begins if b[0] == fb_rid]
+    if not fb_begins:
+        return
+    # 同 fb 多 pass 复用（ping-pong 同 RT 集合）时按 pass 序次取对应 begin；
+    # 唯一匹配（最常见）直接取第一个。
+    begin = fb_begins[0]
+    if len(fb_begins) > 1:
+        try:
+            from rdc.services.query_service import _pass_list_with_fallback
+
+            actions = state.adapter.get_root_actions()
+            passes = _pass_list_with_fallback(actions, sf)
+            me = next(
+                i
+                for i, p in enumerate(passes)
+                if p.get("begin_eid") == detail.get("begin_eid")
+                and p.get("end_eid") == detail.get("end_eid")
+            )
+        except Exception:
+            me = 0
+        begin = fb_begins[min(me, len(fb_begins) - 1)]
+    _rp_rid, clears = begin[1], begin[2]
+    ops = rps.get(_rp_rid, {})
+    for i, ct in enumerate(color_targets):
+        op = ops.get(i, {})
+        clear = clears[i] if i < len(clears) else {}
+        if ct.get("load_op") is None:
+            ct["load_op"] = op.get("load_op")
+        if ct.get("store_op") is None:
+            ct["store_op"] = op.get("store_op")
+        if ct.get("clear_color") is None and "clear_color" in clear:
+            ct["clear_color"] = clear["clear_color"]
+    if depth_target:
+        dslot = len(color_targets)
+        op = ops.get(dslot, {})
+        clear = clears[dslot] if dslot < len(clears) else {}
+        if depth_target.get("load_op") is None:
+            depth_target["load_op"] = op.get("load_op")
+        if depth_target.get("store_op") is None:
+            depth_target["store_op"] = op.get("store_op")
+        if depth_target.get("clear_depth") is None and "clear_depth" in clear:
+            depth_target["clear_depth"] = clear["clear_depth"]
+        if depth_target.get("clear_stencil") is None and "clear_stencil" in clear:
+            depth_target["clear_stencil"] = clear["clear_stencil"]
 
 
 def _handle_log(

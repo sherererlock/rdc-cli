@@ -72,6 +72,110 @@ def _build_sf():
     )
 
 
+def _build_sf_with_renderpass():
+    """SF with Vulkan renderpass chunks: image view 10→image 9, framebuffer 30
+    (attachments [view 10]), renderpass 40 (load=Clear/store=Store), begin with
+    clear color [0,0,0,1]. Mirrors the real capture structured-file layout."""
+    def _obj(name, value=None, children=None, rid=None):
+        return SDObject(
+            name=name,
+            data=SDData(basic=SDBasic(value=value, id=rid or 0)),
+            children=children or [],
+        )
+
+    return StructuredFile(
+        chunks=[
+            SDChunk(
+                name="vkCreateImageView",
+                children=[
+                    _obj("CreateInfo", children=[_obj("image", value=9, rid=9)]),
+                    _obj("View", value=10, rid=10),
+                ],
+            ),
+            SDChunk(
+                name="vkCreateFramebuffer",
+                children=[
+                    _obj(
+                        "CreateInfo",
+                        children=[
+                            _obj("pAttachments", children=[_obj("$el", value=10, rid=10)]),
+                        ],
+                    ),
+                    _obj("Framebuffer", value=30, rid=30),
+                ],
+            ),
+            SDChunk(
+                name="vkCreateRenderPass",
+                children=[
+                    _obj(
+                        "CreateInfo",
+                        children=[
+                            _obj(
+                                "pAttachments",
+                                children=[
+                                    _obj(
+                                        "$el",
+                                        children=[
+                                            _obj("loadOp", value="VK_ATTACHMENT_LOAD_OP_CLEAR"),
+                                            _obj("storeOp", value="VK_ATTACHMENT_STORE_OP_STORE"),
+                                            _obj("stencilLoadOp", value="VK_ATTACHMENT_LOAD_OP_DONT_CARE"),
+                                            _obj("stencilStoreOp", value="VK_ATTACHMENT_STORE_OP_DONT_CARE"),
+                                        ],
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                    _obj("RenderPass", value=40, rid=40),
+                ],
+            ),
+            SDChunk(
+                name="vkCmdBeginRenderPass",
+                children=[
+                    _obj(
+                        "RenderPassBegin",
+                        children=[
+                            _obj("framebuffer", value=30, rid=30),
+                            _obj("renderPass", value=40, rid=40),
+                            _obj(
+                                "pClearValues",
+                                children=[
+                                    _obj(
+                                        "$el",
+                                        children=[
+                                            _obj(
+                                                "color",
+                                                children=[
+                                                    _obj(
+                                                        "float32",
+                                                        children=[
+                                                            _obj("$el", value=0.0),
+                                                            _obj("$el", value=0.0),
+                                                            _obj("$el", value=0.0),
+                                                            _obj("$el", value=1.0),
+                                                        ],
+                                                    ),
+                                                ],
+                                            ),
+                                            _obj(
+                                                "depthStencil",
+                                                children=[
+                                                    _obj("depth", value=1.0),
+                                                    _obj("stencil", value=0),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
 def _make_state():
     actions = _build_actions()
     sf = _build_sf()
@@ -328,8 +432,24 @@ def _make_pass_state():
     actions = _build_pass_actions()
     sf = _build_sf()
     pipe = SimpleNamespace(
-        GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(10))],
-        GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(20)),
+        GetOutputTargets=lambda: [
+            SimpleNamespace(
+                resource=_IntLike(10),
+                loadOp="Clear",
+                storeOp="Store",
+                clearColor=[0.0, 0.0, 0.0, 1.0],
+                clearDepth=None,
+                clearStencil=None,
+            )
+        ],
+        GetDepthTarget=lambda: SimpleNamespace(
+            resource=_IntLike(20),
+            loadOp="Clear",
+            storeOp="Store",
+            clearColor=None,
+            clearDepth=1.0,
+            clearStencil=0,
+        ),
     )
     ctrl = SimpleNamespace(
         GetRootActions=lambda: actions,
@@ -403,8 +523,20 @@ class TestPassHandler:
         resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
         result = resp["result"]
         assert len(result["color_targets"]) == 1
-        assert result["color_targets"][0]["id"] == 10
-        assert result["depth_target"]["id"] == 20
+        c0 = result["color_targets"][0]
+        assert c0["id"] == 10
+        assert c0["load_op"] == "Clear"
+        assert c0["store_op"] == "Store"
+        assert c0["clear_color"] == [0.0, 0.0, 0.0, 1.0]
+        assert c0["clear_depth"] is None
+        assert c0["clear_stencil"] is None
+        dt = result["depth_target"]
+        assert dt["id"] == 20
+        assert dt["load_op"] == "Clear"
+        assert dt["store_op"] == "Store"
+        assert dt["clear_color"] is None
+        assert dt["clear_depth"] == 1.0
+        assert dt["clear_stencil"] == 0
 
     def test_pass_enriched_targets(self):
         state = _make_pass_state()
@@ -431,18 +563,89 @@ class TestPassHandler:
         assert c0["format"] == "R8G8B8A8_UNORM"
         assert c0["width"] == 1920
         assert c0["height"] == 1080
+        assert c0["load_op"] == "Clear"
+        assert c0["store_op"] == "Store"
+        assert c0["clear_color"] == [0.0, 0.0, 0.0, 1.0]
         dt = result["depth_target"]
         assert dt["id"] == 20
         assert dt["name"] == "depth"
         assert dt["format"] == "D32_FLOAT"
+        assert dt["load_op"] == "Clear"
+        assert dt["clear_depth"] == 1.0
+        assert dt["clear_stencil"] == 0
 
     def test_pass_unknown_resource_fallback(self):
         """Unknown resource ID (not in tex_map) falls back to ID-only."""
         resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
         result = resp["result"]
         c0 = result["color_targets"][0]
-        assert c0 == {"id": 10}
-        assert result["depth_target"] == {"id": 20}
+        assert c0["id"] == 10
+        assert "name" not in c0
+        assert "format" not in c0
+        # attachment attrs still captured even when texture metadata is missing
+        assert c0["load_op"] == "Clear"
+        assert c0["clear_color"] == [0.0, 0.0, 0.0, 1.0]
+        assert result["depth_target"]["id"] == 20
+
+    def test_pass_no_attachment_attrs(self):
+        """Old API attachments without loadOp/clear* attrs yield None values."""
+        actions = _build_pass_actions()
+        sf = _build_sf()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(10))],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(20)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0 == {
+            "id": 10,
+            "load_op": None,
+            "store_op": None,
+            "clear_color": None,
+            "clear_depth": None,
+            "clear_stencil": None,
+        }
+        assert result["depth_target"]["load_op"] is None
+
+    def test_pass_sf_attach_fallback(self):
+        """Attach without loadOp/clear attrs (real RenderDoc API) → values filled
+        from the structured file (vkCreateRenderPass ops + vkCmdBeginRenderPass
+        clears), matched by framebuffer attachment resource ids."""
+        actions = _build_pass_actions()
+        sf = _build_sf_with_renderpass()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(9))],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(0)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0["id"] == 9
+        assert c0["load_op"] == "Clear"
+        assert c0["store_op"] == "Store"
+        assert c0["clear_color"] == [0.0, 0.0, 0.0, 1.0]
+        assert result["depth_target"] is None
 
     def test_pass_no_color_targets(self):
         """Pass with no color attachments, only depth."""

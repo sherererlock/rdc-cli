@@ -1224,6 +1224,16 @@ class SDObject:
             return int(self.data.basic.value)
         return 0
 
+    def AsFloat(self) -> float:
+        if self.data and self.data.basic and self.data.basic.value is not None:
+            return float(self.data.basic.value)
+        return 0.0
+
+    def AsResourceId(self) -> ResourceId:
+        if self.data and self.data.basic and self.data.basic.id:
+            return ResourceId(self.data.basic.id)
+        return ResourceId(0)
+
 
 @dataclass
 class SDChunk:
