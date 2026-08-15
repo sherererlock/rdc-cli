@@ -21,3 +21,4 @@ _site/
 docs-astro/.astro/
 docs-astro/dist/
 docs-astro/node_modules/
+*.rdc
