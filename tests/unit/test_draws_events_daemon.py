@@ -176,6 +176,138 @@ def _build_sf_with_renderpass():
     )
 
 
+def _build_sf_multi_begin():
+    """SF with framebuffer 30 reused by two vkCmdBeginRenderPass chunks.
+
+    Execution order: pass A (fb 100, rp 200), pass B (fb 101, rp 201),
+    pass X1 (fb 30, rp 202, clear [0,0,0,0]), pass X2 (fb 30, rp 203, Load).
+    Framebuffer 30's two uses must resolve to begin[0]/begin[1] respectively,
+    not both to the last begin.
+    """
+    def _obj(name, value=None, children=None, rid=None):
+        return SDObject(
+            name=name,
+            data=SDData(basic=SDBasic(value=value, id=rid or 0)),
+            children=children or [],
+        )
+
+    def _rp(load_op):
+        return _obj(
+            "$el",
+            children=[
+                _obj("loadOp", value=load_op),
+                _obj("storeOp", value="VK_ATTACHMENT_STORE_OP_STORE"),
+                _obj("stencilLoadOp", value="VK_ATTACHMENT_LOAD_OP_DONT_CARE"),
+                _obj("stencilStoreOp", value="VK_ATTACHMENT_STORE_OP_DONT_CARE"),
+            ],
+        )
+
+    def _clear_color(rgba):
+        return _obj(
+            "$el",
+            children=[
+                _obj(
+                    "color",
+                    children=[
+                        _obj(
+                            "float32",
+                            children=[_obj("$el", value=v) for v in rgba],
+                        )
+                    ],
+                )
+            ],
+        )
+
+    chunks: list[SDChunk] = []
+    for img in (5, 6, 9):  # image views (view id == image id)
+        chunks.append(
+            SDChunk(
+                name="vkCreateImageView",
+                children=[
+                    _obj("CreateInfo", children=[_obj("image", value=img, rid=img)]),
+                    _obj("View", value=img, rid=img),
+                ],
+            )
+        )
+    for fb, atts in ((100, [5]), (101, [6]), (30, [9])):
+        chunks.append(
+            SDChunk(
+                name="vkCreateFramebuffer",
+                children=[
+                    _obj(
+                        "CreateInfo",
+                        children=[
+                            _obj(
+                                "pAttachments",
+                                children=[_obj("$el", value=v, rid=v) for v in atts],
+                            )
+                        ],
+                    ),
+                    _obj("Framebuffer", value=fb, rid=fb),
+                ],
+            )
+        )
+    for rp, load_op in (
+        (200, "VK_ATTACHMENT_LOAD_OP_CLEAR"),
+        (201, "VK_ATTACHMENT_LOAD_OP_CLEAR"),
+        (202, "VK_ATTACHMENT_LOAD_OP_CLEAR"),
+        (203, "VK_ATTACHMENT_LOAD_OP_LOAD"),
+    ):
+        chunks.append(
+            SDChunk(
+                name="vkCreateRenderPass",
+                children=[
+                    _obj(
+                        "CreateInfo",
+                        children=[_obj("pAttachments", children=[_rp(load_op)])],
+                    ),
+                    _obj("RenderPass", value=rp, rid=rp),
+                ],
+            )
+        )
+
+    def _begin(fb, rp, clear_vals=None):
+        kids = [
+            _obj("framebuffer", value=fb, rid=fb),
+            _obj("renderPass", value=rp, rid=rp),
+        ]
+        if clear_vals is not None:
+            kids.append(_obj("pClearValues", children=[_clear_color(clear_vals)]))
+        return SDChunk(
+            name="vkCmdBeginRenderPass",
+            children=[_obj("RenderPassBegin", children=kids)],
+        )
+
+    chunks += [
+        _begin(100, 200),
+        _begin(101, 201),
+        _begin(30, 202, [0.0, 0.0, 0.0, 0.0]),
+        _begin(30, 203),
+    ]
+    return StructuredFile(chunks=chunks)
+
+
+def _build_4pass_actions():
+    """Four BeginPass actions: (fbA, fbB, fbX, fbX) in execution order."""
+    acts: list[ActionDescription] = []
+    for beid, deid in ((10, 20), (30, 40), (50, 60), (70, 80)):
+        begin = ActionDescription(
+            eventId=beid,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name=f"Pass{beid}",
+        )
+        draw = ActionDescription(
+            eventId=deid,
+            flags=ActionFlags.Drawcall | ActionFlags.Indexed,
+            numIndices=3,
+            numInstances=1,
+            _name="vkCmdDrawIndexed",
+        )
+        begin.children = [draw]
+        acts.append(begin)
+    return acts
+
+
 def _make_state():
     actions = _build_actions()
     sf = _build_sf()
@@ -646,6 +778,50 @@ class TestPassHandler:
         assert c0["store_op"] == "Store"
         assert c0["clear_color"] == [0.0, 0.0, 0.0, 1.0]
         assert result["depth_target"] is None
+
+    def test_pass_sf_attach_ordered_pop(self):
+        """Framebuffer reused by two passes (same RT set, ping-pong): each pass
+        must get ITS OWN begin's renderpass ops + clears in execution order.
+        Without the ordered-pop fix the first user would collapse to the last
+        begin (load_op Load / no clear) instead of Clear + [0,0,0,0]."""
+        actions = _build_4pass_actions()
+        sf = _build_sf_multi_begin()
+        current = {"eid": 10}
+        _targets = {10: 5, 30: 6, 50: 9, 70: 9}
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [
+                SimpleNamespace(resource=_IntLike(_targets[current["eid"]]))
+            ],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(0)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: current.__setitem__("eid", eid),
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(
+            ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf
+        )
+
+        # first user of fb 30 → its own begin[0] (rp 202: Clear + [0,0,0,0])
+        resp, _ = _handle_request(rpc_request("pass", {"index": 2}), state)
+        c0 = resp["result"]["color_targets"][0]
+        assert c0["id"] == 9
+        assert c0["load_op"] == "Clear"
+        assert c0["store_op"] == "Store"
+        assert c0["clear_color"] == [0.0, 0.0, 0.0, 0.0]
+
+        # second user of fb 30 → its own begin[1] (rp 203: Load, no clear)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 3}), state)
+        c0 = resp["result"]["color_targets"][0]
+        assert c0["id"] == 9
+        assert c0["load_op"] == "Load"
+        assert c0["store_op"] == "Store"
+        assert c0["clear_color"] is None
 
     def test_pass_no_color_targets(self):
         """Pass with no color attachments, only depth."""

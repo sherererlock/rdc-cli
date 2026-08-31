@@ -553,15 +553,31 @@ def _fill_sf_attach_info(state: DaemonState, detail: dict, identifier: int | str
 
             actions = state.adapter.get_root_actions()
             passes = _pass_list_with_fallback(actions, sf)
-            me = next(
+            cur = next(
                 i
                 for i, p in enumerate(passes)
                 if p.get("begin_eid") == detail.get("begin_eid")
                 and p.get("end_eid") == detail.get("end_eid")
             )
+            # begins 与 passes 同为执行序（graphics pass ↔ vkCmdBeginRenderPass
+            # 按序 1:1）。当前 pass 的 begin 在 begins 中的位置 = 它前面「有
+            # begin」的 pass 数（纯 compute 等无 vkCmdBeginRenderPass 的 pass
+            # 不占位）。同 fb 第 use 次复用 → 取 fb_begins[use]：按序 pop，而
+            # 不是用全局 pass 序号 cur 直接做 fb_begins 下标（复用时会把所有
+            # use 都塌到最后一个 begin）。
+            def _has_begin(p: dict) -> bool:
+                return not (
+                    p.get("draws", 0) == 0
+                    and p.get("dispatches", 0) > 0
+                    and (p.get("copies", 0) or 0) == 0
+                    and (p.get("clears", 0) or 0) == 0
+                )
+
+            pb = sum(1 for p in passes[:cur] if _has_begin(p))
+            use = sum(1 for pos, b in enumerate(begins) if b[0] == fb_rid and pos < pb)
+            begin = fb_begins[min(use, len(fb_begins) - 1)]
         except Exception:
-            me = 0
-        begin = fb_begins[min(me, len(fb_begins) - 1)]
+            begin = fb_begins[0]
     _rp_rid, clears = begin[1], begin[2]
     ops = rps.get(_rp_rid, {})
     for i, ct in enumerate(color_targets):
