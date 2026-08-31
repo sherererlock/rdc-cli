@@ -23,20 +23,53 @@ if TYPE_CHECKING:
     from rdc.daemon_server import DaemonState
 
 
+# (comp_width, CompType) -> (struct format char, divisor)
+# CompType follows RenderDoc's enum: 1=Float 2=UNorm 3=SNorm 4=UInt 5=SInt.
+# Normalized formats divide by 2^n-1 / 2^(n-1)-1 (industry/Unity convention);
+# integer formats divide by 1.0 so JSON values stay floats (5.0, not 5).
+_DECODE_TABLE: dict[tuple[int, int], tuple[str, float]] = {
+    (4, 1): ("f", 1.0),
+    (4, 2): ("I", 4294967295.0),
+    (4, 3): ("i", 2147483647.0),
+    (4, 4): ("I", 1.0),
+    (4, 5): ("i", 1.0),
+    (2, 1): ("e", 1.0),
+    (2, 2): ("H", 65535.0),
+    (2, 3): ("h", 32767.0),
+    (2, 4): ("H", 1.0),
+    (2, 5): ("h", 1.0),
+    (1, 1): ("B", 255.0),
+    (1, 2): ("B", 255.0),
+    (1, 3): ("b", 127.0),
+    (1, 4): ("B", 1.0),
+    (1, 5): ("b", 1.0),
+}
+# Unknown width/type combos (Typeless=0, Depth=8, ...) keep the legacy
+# float-family behavior.
+_DECODE_FALLBACK: dict[int, tuple[str, float]] = {
+    4: ("f", 1.0), 2: ("e", 1.0), 1: ("B", 255.0),
+}
+
+
 def _decode_float_components(
-    data: bytes, offset: int, comp_width: int, comp_count: int
+    data: bytes, offset: int, comp_width: int, comp_count: int, comp_type: int
 ) -> list[float]:
-    """Decode comp_count float components of comp_width bytes each starting at offset."""
-    result: list[float] = []
-    for i in range(comp_count):
-        off = offset + i * comp_width
-        if comp_width == 4:
-            result.append(struct.unpack_from("<f", data, off)[0])
-        elif comp_width == 2:
-            result.append(struct.unpack_from("<e", data, off)[0])
-        else:  # comp_width == 1
-            result.append(data[off] / 255.0)
-    return result
+    """Decode comp_count components of comp_width bytes each as floats.
+
+    comp_type follows RenderDoc's CompType enum (1=Float, 2=UNorm, 3=SNorm,
+    4=UInt, 5=SInt). Normalized formats decode to [-1, 1] / [0, 1] floats --
+    before this, R16G16_SNORM vertex attributes (e.g. hair UV sets) were
+    misread as half-precision floats, producing garbage UVs.
+    """
+    fmt_char, divisor = _DECODE_TABLE.get(
+        (comp_width, comp_type), _DECODE_FALLBACK.get(comp_width, ("f", 1.0))
+    )
+    return [v / divisor for v in struct.unpack_from(f"<{comp_count}{fmt_char}", data, offset)]
+
+
+def _fmt_attr(fmt: Any, name: str, default: Any) -> Any:
+    """Read an attribute off a RenderDoc format object, defaulting when absent."""
+    return getattr(fmt, name, default) if fmt else default
 
 
 def _decode_index_buffer(data: bytes, stride: int) -> list[int]:
@@ -313,7 +346,7 @@ def _handle_vbuffer_decode(  # noqa: PLR0912
     col_defs: list[dict[str, Any]] = []
     for vi in inputs:
         fmt = getattr(vi, "format", None)
-        comp_count = getattr(fmt, "compCount", 1) if fmt else 1
+        comp_count = _fmt_attr(fmt, "compCount", 1)
         attr_name = getattr(vi, "name", "attr")
         if comp_count == 1:
             columns.append(attr_name)
@@ -326,7 +359,8 @@ def _handle_vbuffer_decode(  # noqa: PLR0912
                 "vbSlot": getattr(vi, "vertexBuffer", 0),
                 "byteOffset": getattr(vi, "byteOffset", 0),
                 "compCount": comp_count,
-                "compByteWidth": getattr(fmt, "compByteWidth", 4) if fmt else 4,
+                "compByteWidth": _fmt_attr(fmt, "compByteWidth", 4),
+                "compType": _fmt_attr(fmt, "compType", 1),
             }
         )
     buf_data: dict[int, bytes] = {}
@@ -336,6 +370,7 @@ def _handle_vbuffer_decode(  # noqa: PLR0912
             size = getattr(vb, "byteSize", 0)
             offset = getattr(vb, "byteOffset", 0)
             buf_data[i] = controller.GetBufferData(rid, offset, size)
+    offset_verts = int(params.get("offset_verts", 0) or 0)
     num_verts = int(params.get("count", 0))
     if num_verts == 0 and vbuffers:
         vb0 = vbuffers[0]
@@ -351,16 +386,16 @@ def _handle_vbuffer_decode(  # noqa: PLR0912
             data = buf_data.get(slot, b"")
             vb = vbuffers[slot] if slot < len(vbuffers) else None
             stride = getattr(vb, "byteStride", 0) if vb else 0
-            base = vi_idx * stride + cd["byteOffset"]
+            base = (vi_idx + offset_verts) * stride + cd["byteOffset"]
             cw = cd["compByteWidth"]
             cc = cd["compCount"]
             if base + cw * cc <= len(data) and cw in (1, 2, 4):
-                vtx_row.extend(_decode_float_components(data, base, cw, cc))
+                vtx_row.extend(_decode_float_components(data, base, cw, cc, cd["compType"]))
             else:
                 for c in range(cc):
                     off = base + c * cw
                     if off + cw <= len(data) and cw in (1, 2, 4):
-                        vtx_row.extend(_decode_float_components(data, off, cw, 1))
+                        vtx_row.extend(_decode_float_components(data, off, cw, 1, cd["compType"]))
                     else:
                         vtx_row.append(0.0)
         vertices.append(vtx_row)
@@ -405,8 +440,8 @@ def _decode_mesh_postvs(controller: Any, mesh: Any) -> dict[str, Any]:
     if vrid == 0 or stride == 0:
         raise ValueError("no PostVS data at this event")
     fmt = getattr(mesh, "format", None)
-    comp_width = getattr(fmt, "compByteWidth", 4) if fmt else 4
-    comp_count = getattr(fmt, "compCount", 4) if fmt else 4
+    comp_width = _fmt_attr(fmt, "compByteWidth", 4)
+    comp_count = _fmt_attr(fmt, "compCount", 4)
     pos_offset = getattr(mesh, "vertexByteOffset", 0)
     v_size = _known_byte_size(getattr(mesh, "vertexByteSize", 0))
     if v_size == 0:
@@ -418,7 +453,10 @@ def _decode_mesh_postvs(controller: Any, mesh: Any) -> dict[str, Any]:
         irid = getattr(mesh, "indexResourceId", None)
         if irid is None or int(irid) == 0:
             num_verts = min(num_verts, num_indices)
-    vertices = _decode_position_rows(raw, num_verts, stride, pos_offset, comp_width, comp_count)
+    vertices = _decode_position_rows(
+        raw, num_verts, stride, pos_offset, comp_width, comp_count,
+        _fmt_attr(fmt, "compType", 1),
+    )
 
     irid = int(getattr(mesh, "indexResourceId", 0))
     base_vertex = getattr(mesh, "baseVertex", 0)
@@ -448,18 +486,19 @@ def _decode_position_rows(
     pos_offset: int,
     comp_width: int,
     comp_count: int,
+    comp_type: int = 1,
 ) -> list[list[float]]:
     vertices: list[list[float]] = []
     for i in range(num_verts):
         base = i * stride + pos_offset
         if base + comp_width * comp_count <= len(raw) and comp_width in (1, 2, 4):
-            vertices.append(_decode_float_components(raw, base, comp_width, comp_count))
+            vertices.append(_decode_float_components(raw, base, comp_width, comp_count, comp_type))
         else:
             comps: list[float] = []
             for c in range(comp_count):
                 off = base + c * comp_width
                 if off + comp_width <= len(raw) and comp_width in (1, 2, 4):
-                    comps.extend(_decode_float_components(raw, off, comp_width, 1))
+                    comps.extend(_decode_float_components(raw, off, comp_width, 1, comp_type))
                 else:
                     comps.append(0.0)
             vertices.append(comps)
@@ -487,9 +526,16 @@ def _is_position_semantic(vi: Any) -> bool:
 
 
 def _is_instance_input(vi: Any) -> bool:
+    # perInstance is authoritative when the API reports it (e.g. Vulkan's
+    # VK_VERTEX_INPUT_RATE_INSTANCE). Some Vulkan drivers (e.g. Adreno) report
+    # a non-zero instanceRate even for plain per-vertex attributes, so only
+    # fall back to the rate-based heuristics when perInstance isn't available
+    # at all.
+    per_instance = getattr(vi, "perInstance", None)
+    if per_instance is not None:
+        return bool(per_instance)
     return bool(
-        getattr(vi, "perInstance", False)
-        or int(getattr(vi, "instanceRate", 0) or 0) > 0
+        int(getattr(vi, "instanceRate", 0) or 0) > 0
         or getattr(vi, "instanced", False)
         or int(getattr(vi, "instStepRate", 0) or 0) > 0
     )
@@ -623,8 +669,8 @@ def _mesh_data_from_ia(
         raise ValueError(f"vertex buffer for {input_name!r} (slot {slot}) is not bound")
 
     fmt = getattr(pos_input, "format", None)
-    comp_width = getattr(fmt, "compByteWidth", 4) if fmt else 4
-    comp_count = getattr(fmt, "compCount", 3) if fmt else 3
+    comp_width = _fmt_attr(fmt, "compByteWidth", 4)
+    comp_count = _fmt_attr(fmt, "compCount", 3)
     fmt_name = _format_name(fmt)
     vb_offset = getattr(vb, "byteOffset", 0)
     action_count = int(getattr(action, "numIndices", 0) or 0)
@@ -670,7 +716,10 @@ def _mesh_data_from_ia(
         if read_size
         else b""
     )
-    vertices = _decode_position_rows(raw, num_verts, stride, pos_offset, comp_width, comp_count)
+    vertices = _decode_position_rows(
+        raw, num_verts, stride, pos_offset, comp_width, comp_count,
+        _fmt_attr(fmt, "compType", 1),
+    )
 
     result = {
         "topology": _enum_name(pipe_state.GetPrimitiveTopology()),
@@ -687,6 +736,13 @@ def _mesh_data_from_ia(
         "position_byte_offset": int(pos_offset),
         "position_format": fmt_name,
         "position_comp_count": int(comp_count),
+        # Buffer-absolute index of the first vertex block entry: the `indices`
+        # array is normalised relative to this vertex (min(referenced)), so any
+        # consumer that re-uses `vertices`/`indices` against an independently
+        # decoded *full-buffer* array (e.g. the vbuffer VFS leaf) must offset
+        # its reads by this many vertices or the data is misaligned
+        # (hair-tail mesh_511: baseVertex=12 → FBX pulled buffer[0..11] debris).
+        "position_first_vertex": int(first_vertex),
     }
     if position_warning:
         result["position_warning"] = position_warning

@@ -275,6 +275,7 @@ def _deliver_binary(path: str, match: Any, raw: bool, output: str | None) -> Non
 def cat_cmd(path: str, use_json: bool, raw: bool, output: str | None) -> None:
     """Output VFS leaf node content."""
     path = _recover_msys_path(path)
+    path, _, query_str = path.partition("?")
     result = call("vfs_ls", {"path": path})
     kind = result.get("kind")
     resolved_path = result.get("path", path)
@@ -290,6 +291,20 @@ def cat_cmd(path: str, use_json: bool, raw: bool, output: str | None) -> None:
     if match is None or match.handler is None:
         click.echo(f"error: {path}: no content handler", err=True)
         raise SystemExit(1)
+
+    # Query-string parameters (e.g. ?offset_verts=12;count=867) are forwarded to
+    # the handler as string params; each handler coerces to int with a default.
+    # Pairs are separated by ';' -- '&' is shell-unsafe through the .bat
+    # wrapper on Windows (cmd splits on it), so ';' is the canonical form here;
+    # a stray '&' form is still parsed for robustness.
+    if query_str:
+        query_str = query_str.replace("&", ";")
+        parts = [p.strip() for p in query_str.split(";") if p.strip()]
+        for qk in parts:
+            key, _, value = qk.partition("=")
+            key = key.strip()
+            if key and key not in match.args:
+                match.args[key] = value.strip()
 
     if kind == "leaf_bin":
         _deliver_binary(path, match, raw, output)
