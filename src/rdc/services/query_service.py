@@ -365,33 +365,38 @@ _SKIP_DESC_TYPES = frozenset({"Sampler", "UniformBuffer", "ConstantBuffer"})
 
 
 def bindings_rows(eid: int, pipe_state: Any) -> list[dict[str, Any]]:
-    """Get descriptor binding rows for all shader stages.
-
-    ``DescriptorAccess.index`` is documented by renderdoc as the position of
-    that descriptor within its *own* reflection list (readOnlyResources /
-    readWriteResources for the stage) -- not the declared ``fixedBindNumber``.
-    Resources must therefore be looked up as ``reflection_list[access.index]``;
-    joining ``access.index`` against ``fixedBindNumber`` is wrong whenever bind
-    numbers don't start at 0 and run contiguously (see descriptor.py's
-    ``_resolve_binding``, which uses the same correlation and is known-correct).
-    """
+    """Get descriptor binding rows for all shader stages."""
     rows: list[dict[str, Any]] = []
 
-    # (stage_int, kind) -> {reflection_index: resource_id}. Excludes samplers/CBVs.
-    desc_by_index: dict[tuple[int, str], dict[int, int]] = {}
+    # Build runtime resource_id lookup from GetAllUsedDescriptors.
+    # renderdoc documents DescriptorAccess.index as the index into the shader's
+    # reflection list *for that descriptor type* (ro vs rw are separate lists,
+    # each indexed from 0) -- it is NOT the layout binding number (fixedBindNumber).
+    # Joining it against fixedBindNumber silently drops every resource whenever a
+    # shader's bind numbers don't start at 0 (e.g. samplers occupying slots 0..9
+    # push texture fixedBindNumbers to 10..19 while reflection-list index stays 0..9).
+    # Key: (stage_int, kind, reflection_index) -> resource_id.
+    desc_map: dict[tuple[int, str, int], int] = {}
+    # Sorted (acc_index, rid) per (stage, kind) for positional fallback (OpenGL-style).
+    desc_ordered: dict[tuple[int, str], list[tuple[int, int]]] = {}
     if hasattr(pipe_state, "GetAllUsedDescriptors"):
         try:
+            stage_acc: dict[tuple[int, str], dict[int, int]] = {}
             for ud in pipe_state.GetAllUsedDescriptors(True):
                 acc = ud.access
                 desc = ud.descriptor
                 type_name = getattr(acc.type, "name", str(acc.type))
                 if type_name in _SKIP_DESC_TYPES:
                     continue
-                rid = int(desc.resource)
-                if rid == 0:
-                    continue
                 kind = "rw" if type_name.startswith("ReadWrite") else "ro"
-                desc_by_index.setdefault((int(acc.stage), kind), {})[int(acc.index)] = rid
+                rid = int(desc.resource)
+                if rid != 0:
+                    si = int(acc.stage)
+                    stage_acc.setdefault((si, kind), {})[int(acc.index)] = rid
+            for key, slots in stage_acc.items():
+                for idx, rid in slots.items():
+                    desc_map[(key[0], key[1], idx)] = rid
+                desc_ordered[key] = sorted(slots.items())
         except Exception:  # noqa: BLE001
             pass
 
@@ -399,23 +404,95 @@ def bindings_rows(eid: int, pipe_state: Any) -> list[dict[str, Any]]:
         refl = pipe_state.GetShaderReflection(stage_val)
         if refl is None:
             continue
+        # sampler filter map: fixedBindNumber -> filter。VK COMBINED_IMAGE_SAMPLER
+        # 下 texture 与 sampler 同绑定点；shader reflection 声明序（refl.samplers）
+        # 与 GetSamplers 实际绑定序对应。附加到 texture 行供下游判断
+        # bilinear/point（半像素偏移语义）等。
+        sampler_filters: dict = {}
+        try:
+            _bound = pipe_state.GetSamplers(stage_val, True)
+            for _j, _ss in enumerate(getattr(refl, "samplers", None) or []):
+                if _j >= len(_bound):
+                    break
+                _sd = getattr(_bound[_j], "sampler", _bound[_j])
+                _tf = getattr(_sd, "filter", None)
+                if _tf is not None:
+                    _bn = getattr(_ss, "fixedBindNumber", 0)
+                    try:
+                        _mgn = getattr(getattr(_tf, "magnify", None), "name", "")
+                        _min = getattr(getattr(_tf, "minify", None), "name", "")
+                        _mip = getattr(getattr(_tf, "mip", None), "name", "")
+                        sampler_filters[_bn] = f"{_mgn}_{_min}_Mip{_mip}"
+                    except Exception:
+                        sampler_filters[_bn] = str(_tf)
+        except Exception:
+            sampler_filters = {}
         for resources, kind in (
             (getattr(refl, "readOnlyResources", []), "ro"),
             (getattr(refl, "readWriteResources", []), "rw"),
         ):
-            index_map = desc_by_index.get((stage_val, kind), {})
+            ordered = desc_ordered.get((stage_val, kind), [])
+            bind_nums = [getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)) for r in resources]
+            # OpenGL: fixedBindNumber is 0 for all samplers when glUniform1i assigns
+            # texture units rather than layout(binding=N). Positional matching against
+            # GetAllUsedDescriptors (sorted by acc.index = texture unit) recovers
+            # the correct per-slot resource.
+            positional = len(bind_nums) > 1 and len(set(bind_nums)) == 1
             for i, r in enumerate(resources):
-                rows.append(
-                    {
-                        "eid": eid,
-                        "stage": stage_name,
-                        "kind": kind,
-                        "set": getattr(r, "fixedBindSetOrSpace", 0),
-                        "slot": getattr(r, "fixedBindNumber", getattr(r, "bindPoint", 0)),
-                        "name": r.name,
-                        "resource_id": index_map.get(i, 0) or "",
-                    }
-                )
+                slot = bind_nums[i] if i < len(bind_nums) else 0
+                if positional and i < len(ordered):
+                    _acc_idx, rid = ordered[i]
+                else:
+                    rid = desc_map.get((stage_val, kind, i), 0)
+                _row = {
+                    "eid": eid,
+                    "stage": stage_name,
+                    "kind": kind,
+                    "set": getattr(r, "fixedBindSetOrSpace", 0),
+                    "slot": slot,
+                    "name": r.name,
+                    "resource_id": rid or "",
+                }
+                _is_tex = getattr(r, "isTexture", False)
+                if not _is_tex and hasattr(r, "type"):
+                    try:
+                        _is_tex = getattr(r.type, "name", "") == "Texture"
+                    except Exception:
+                        _is_tex = False
+                # 根因B修复（sampler-filter-state-gap.md）：这里查 sampler_filters 只对
+                # combined image-sampler（VK/GLSL 常见）成立——那种模型下 texture 自己
+                # 的 fixedBindNumber 就是 sampler 的绑定号（hasSampler=True 是标志）。
+                # HLSL/spirv-cross 的 separate-sampler 模型下 texture 和 sampler 是两个
+                # 独立绑定点，用纹理自己的 bindNumber 去查"以 sampler bindNumber 为键"的
+                # 字典永远查空——之前没有 hasSampler 判断，会用错误 key 查询后静默写 ""，
+                # 看起来"查了但没有值"，实际是键空间完全不重叠。加 hasSampler 门槛后，
+                # separate-sampler 模型下这个字段干脆不写（下游改走新增的 kind="sampler"
+                # 行，按 slot=Binding(N) 精确关联，见下方）。
+                if kind == "ro" and _is_tex and getattr(r, "hasSampler", False):
+                    _row["sampler_filter"] = sampler_filters.get(
+                        getattr(r, "fixedBindNumber", 0), ""
+                    )
+                rows.append(_row)
+
+        # 根因B修复：separate-sampler 模型下，sampler 本身是 refl.samplers 里的独立
+        # 声明（各自的 fixedBindNumber，如 eid316 的 sampler _36:Binding(1)/_90:Binding(0)），
+        # 不挂在任何 texture 行上。之前 sampler_filters 字典算完就地扔了（只用来误 join
+        # 进纹理行）。这里补一条 kind="sampler" 的独立行，让下游（shader_slice.py 静态解析
+        # 出每条采样指令实际用的 sampler Binding(N) 后）能按 slot 精确关联到 filter 模式，
+        # 而不必猜"这张贴图用哪个 filter"（一张贴图可能被多个 sampler 采样，见文档"更深
+        # 一层"部分）。
+        for _ss in getattr(refl, "samplers", None) or []:
+            _bn = getattr(_ss, "fixedBindNumber", 0)
+            rows.append({
+                "eid": eid,
+                "stage": stage_name,
+                "kind": "sampler",
+                "set": getattr(_ss, "fixedBindSetOrSpace", 0),
+                "slot": _bn,
+                "name": _ss.name,
+                "resource_id": "",
+                "sampler_filter": sampler_filters.get(_bn, ""),
+            })
     return rows
 
 
