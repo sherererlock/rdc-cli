@@ -168,12 +168,17 @@ _r(r"/draws/(?P<eid>\d+)/bindings/(?P<set>\d+)", "dir", None, [("eid", int), ("s
 # draw targets
 _r(r"/draws/(?P<eid>\d+)/targets", "dir", None, [("eid", int)])
 _r(
-    r"/draws/(?P<eid>\d+)/targets/color(?P<target>\d+)\.png",
+    r"/draws/(?P<eid>\d+)/targets/color(?P<target>\d+)\.(?P<format>png|tga)",
     "leaf_bin",
     "rt_export",
-    [("eid", int), ("target", int)],
+    [("eid", int), ("target", int), ("format", str)],
 )
-_r(r"/draws/(?P<eid>\d+)/targets/depth\.png", "leaf_bin", "rt_depth", [("eid", int)])
+_r(
+    r"/draws/(?P<eid>\d+)/targets/depth\.(?P<format>png|tga)",
+    "leaf_bin",
+    "rt_depth",
+    [("eid", int), ("format", str)],
+)
 
 # passes
 _r("/passes", "dir")
@@ -198,13 +203,13 @@ _r(r"/shaders/(?P<id>\d+)/used-by", "leaf", "shader_used_by", [("id", int)])
 _r("/textures", "dir")
 _r(r"/textures/(?P<id>\d+)", "dir", None, [("id", int)])
 _r(r"/textures/(?P<id>\d+)/info", "leaf", "tex_info", [("id", int)])
-_r(r"/textures/(?P<id>\d+)/image\.png", "leaf_bin", "tex_export", [("id", int)])
+_r(r"/textures/(?P<id>\d+)/image\.(?P<format>png|tga)", "leaf_bin", "tex_export", [("id", int), ("format", str)])
 _r(r"/textures/(?P<id>\d+)/mips", "dir", None, [("id", int)])
 _r(
-    r"/textures/(?P<id>\d+)/mips/(?P<mip>\d+)\.png",
+    r"/textures/(?P<id>\d+)/mips/(?P<mip>\d+)\.(?P<format>png|tga)",
     "leaf_bin",
     "tex_export",
-    [("id", int), ("mip", int)],
+    [("id", int), ("mip", int), ("format", str)],
 )
 _r(r"/textures/(?P<id>\d+)/data", "leaf_bin", "tex_raw", [("id", int)])
 

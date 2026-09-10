@@ -103,7 +103,7 @@ def _complete_rt_target(
             if not isinstance(child, dict):
                 continue
             name = str(child.get("name", ""))
-            match = re.fullmatch(r"color(\d+)\.png", name)
+            match = re.fullmatch(r"color(\d+)\.(?:png|tga)", name)
             if match is None:
                 continue
             target = match.group(1)
@@ -119,10 +119,21 @@ def _complete_rt_target(
 @click.argument("id", type=int, shell_complete=_complete_texture_id)
 @click.option("-o", "--output", type=click.Path(), default=None, help="Write to file")
 @click.option("--mip", default=0, type=int, help="Mip level (default 0)")
+@click.option(
+    "--format",
+    "image_format",
+    type=click.Choice(["png", "tga"]),
+    default="png",
+    help="Image format for the export (default: png)",
+)
 @click.option("--raw", is_flag=True, help="Force raw output even on TTY")
-def texture_cmd(id: int, output: str | None, mip: int, raw: bool) -> None:
-    """Export texture as PNG."""
-    vfs_path = f"/textures/{id}/mips/{mip}.png" if mip > 0 else f"/textures/{id}/image.png"
+def texture_cmd(id: int, output: str | None, mip: int, image_format: str, raw: bool) -> None:
+    """Export texture as PNG/TGA."""
+    vfs_path = (
+        f"/textures/{id}/mips/{mip}.{image_format}"
+        if mip > 0
+        else f"/textures/{id}/image.{image_format}"
+    )
     _export_vfs_path(vfs_path, output, raw)
 
 
@@ -140,10 +151,17 @@ def texture_cmd(id: int, output: str | None, mip: int, raw: bool) -> None:
     "--depth",
     is_flag=True,
     help=(
-        "Export the raw depth attachment texture (/draws/<eid>/targets/depth.png); "
+        "Export the raw depth attachment texture (/draws/<eid>/targets/depth.<format>); "
         "distinct from --overlay depth, which renders RenderDoc's depth overlay "
         "visualization. Ignored when --overlay is set."
     ),
+)
+@click.option(
+    "--format",
+    "image_format",
+    type=click.Choice(["png", "tga"]),
+    default="png",
+    help="Image format for the export (default: png; ignored with --overlay)",
 )
 @click.option("--raw", is_flag=True, help="Force raw output even on TTY")
 @click.option(
@@ -171,12 +189,13 @@ def rt_cmd(
     output: str | None,
     target: int | None,
     depth: bool,
+    image_format: str,
     raw: bool,
     overlay: str | None,
     width: int,
     height: int,
 ) -> None:
-    """Export render target as PNG."""
+    """Export render target as PNG/TGA."""
     if overlay:
         params: dict[str, object] = {"overlay": overlay, "width": width, "height": height}
         if eid is not None:
@@ -208,11 +227,11 @@ def rt_cmd(
     if depth:
         if target is not None:
             raise click.UsageError("--depth and --target are mutually exclusive")
-        _export_vfs_path(f"/draws/{eid}/targets/depth.png", output, raw)
+        _export_vfs_path(f"/draws/{eid}/targets/depth.{image_format}", output, raw)
         return
 
     color = target if target is not None else 0
-    _export_vfs_path(f"/draws/{eid}/targets/color{color}.png", output, raw)
+    _export_vfs_path(f"/draws/{eid}/targets/color{color}.{image_format}", output, raw)
 
 
 @click.command("buffer")

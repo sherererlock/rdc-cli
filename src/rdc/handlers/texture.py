@@ -74,8 +74,9 @@ def _export_remote(
     mip: int,
     *,
     is_depth: bool = False,
+    image_format: str = "png",
 ) -> tuple[dict[str, Any], bool]:
-    """Fetch raw pixels over the wire and decode them locally to a PNG."""
+    """Fetch raw pixels over the wire and decode them locally to PNG/TGA."""
     controller = state.adapter.controller  # type: ignore[union-attr]
     sub = _make_subresource(state.rd, mip)
     try:
@@ -84,7 +85,9 @@ def _export_remote(
         return _error_response(request_id, -32002, f"GetTextureData failed: {exc}"), True
     if not raw:
         return _error_response(request_id, -32002, "no texture data returned"), True
-    png = _decode_texture_png(state.rd, tex, raw, mip, is_depth=is_depth)
+    png = _decode_texture_png(
+        state.rd, tex, raw, mip, is_depth=is_depth, image_format=image_format
+    )
     if png is None:
         fmt_name = tex.format.Name() if hasattr(tex.format, "Name") else ""
         return _error_response(
@@ -120,11 +123,14 @@ def _handle_tex_export(
     err = _set_frame_event(state, eid)
     if err:
         return _error_response(request_id, -32002, err), True
-    temp_path = state.temp_dir / f"tex_{res_id}_mip{mip}.png"
+    image_format = str(params.get("format", "png"))
+    temp_path = state.temp_dir / f"tex_{res_id}_mip{mip}.{image_format}"
     if state.is_remote:
-        return _export_remote(request_id, state, tex, tex.resourceId, temp_path, mip)
+        return _export_remote(
+            request_id, state, tex, tex.resourceId, temp_path, mip, image_format=image_format
+        )
     controller = state.adapter.controller
-    texsave = _make_texsave(state.rd, tex.resourceId, mip)
+    texsave = _make_texsave(state.rd, tex.resourceId, mip, image_format=image_format)
     success = controller.SaveTexture(texsave, str(temp_path))
     if not success or not temp_path.exists():
         return _error_response(request_id, -32002, "SaveTexture failed"), True
@@ -185,13 +191,16 @@ def _handle_rt_export(
     if not 0 <= target_idx < len(color_targets):
         return _error_response(request_id, -32001, f"target index {target_idx} out of range"), True
     resource = color_targets[target_idx]
-    temp_path = state.temp_dir / f"rt_{eid}_color{target_idx}.png"
+    image_format = str(params.get("format", "png"))
+    temp_path = state.temp_dir / f"rt_{eid}_color{target_idx}.{image_format}"
     if state.is_remote:
         tex = state.tex_map.get(int(resource))
         if tex is None:
             return _error_response(request_id, -32001, f"target {int(resource)} not found"), True
-        return _export_remote(request_id, state, tex, resource, temp_path, 0)
-    texsave = _make_texsave(state.rd, resource)
+        return _export_remote(
+            request_id, state, tex, resource, temp_path, 0, image_format=image_format
+        )
+    texsave = _make_texsave(state.rd, resource, image_format=image_format)
     success = state.adapter.controller.SaveTexture(texsave, str(temp_path))  # type: ignore[union-attr]
     if not success or not temp_path.exists():
         return _error_response(request_id, -32002, "SaveTexture failed"), True
@@ -215,17 +224,20 @@ def _handle_rt_depth(
     depth = resolve_depth_target(pipe, state)
     if depth is None or int(depth) == 0:
         return _error_response(request_id, -32001, f"no depth target at eid {eid}"), True
-    temp_path = state.temp_dir / f"rt_{eid}_depth.png"
+    image_format = str(params.get("format", "png"))
+    temp_path = state.temp_dir / f"rt_{eid}_depth.{image_format}"
     tex = state.tex_map.get(int(depth))
     if tex is None:
         return _error_response(
             request_id, -32001, f"depth target {int(depth)} not found"
         ), True
-    resp, running = _export_remote(request_id, state, tex, depth, temp_path, 0, is_depth=True)
+    resp, running = _export_remote(
+        request_id, state, tex, depth, temp_path, 0, is_depth=True, image_format=image_format
+    )
     # Combined depth-stencil and MSAA formats decode to None (-32002). Locally,
     # SaveTexture can still export them (RGBA); remote returns the error as-is.
     if resp.get("error", {}).get("code") == -32002 and not state.is_remote:
-        texsave = _make_texsave(state.rd, depth)
+        texsave = _make_texsave(state.rd, depth, image_format=image_format)
         success = state.adapter.controller.SaveTexture(texsave, str(temp_path))  # type: ignore[union-attr]
         if not success or not temp_path.exists():
             return _error_response(request_id, -32002, "SaveTexture failed"), True

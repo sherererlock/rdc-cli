@@ -350,7 +350,16 @@ def test_textures_id_info() -> None:
 
 def test_textures_id_image_png() -> None:
     m = resolve_path("/textures/42/image.png")
-    assert m == PathMatch(kind="leaf_bin", handler="tex_export", args={"id": 42})
+    assert m == PathMatch(
+        kind="leaf_bin", handler="tex_export", args={"id": 42, "format": "png"}
+    )
+
+
+def test_textures_id_image_tga() -> None:
+    m = resolve_path("/textures/42/image.tga")
+    assert m == PathMatch(
+        kind="leaf_bin", handler="tex_export", args={"id": 42, "format": "tga"}
+    )
 
 
 def test_textures_id_mips_dir() -> None:
@@ -361,7 +370,16 @@ def test_textures_id_mips_dir() -> None:
 @pytest.mark.parametrize("mip", [0, 3])
 def test_textures_id_mips_png(mip: int) -> None:
     m = resolve_path(f"/textures/42/mips/{mip}.png")
-    assert m == PathMatch(kind="leaf_bin", handler="tex_export", args={"id": 42, "mip": mip})
+    assert m == PathMatch(
+        kind="leaf_bin", handler="tex_export", args={"id": 42, "mip": mip, "format": "png"}
+    )
+
+
+def test_textures_id_mips_tga() -> None:
+    m = resolve_path("/textures/42/mips/1.tga")
+    assert m == PathMatch(
+        kind="leaf_bin", handler="tex_export", args={"id": 42, "mip": 1, "format": "tga"}
+    )
 
 
 def test_textures_id_data() -> None:
@@ -398,12 +416,30 @@ def test_draws_targets_dir() -> None:
 @pytest.mark.parametrize("target", [0, 3])
 def test_draws_targets_color_png(target: int) -> None:
     m = resolve_path(f"/draws/142/targets/color{target}.png")
-    assert m == PathMatch(kind="leaf_bin", handler="rt_export", args={"eid": 142, "target": target})
+    assert m == PathMatch(
+        kind="leaf_bin",
+        handler="rt_export",
+        args={"eid": 142, "target": target, "format": "png"},
+    )
+
+
+def test_draws_targets_color_tga() -> None:
+    m = resolve_path("/draws/142/targets/color0.tga")
+    assert m == PathMatch(
+        kind="leaf_bin",
+        handler="rt_export",
+        args={"eid": 142, "target": 0, "format": "tga"},
+    )
 
 
 def test_draws_targets_depth_png() -> None:
     m = resolve_path("/draws/142/targets/depth.png")
-    assert m == PathMatch(kind="leaf_bin", handler="rt_depth", args={"eid": 142})
+    assert m == PathMatch(kind="leaf_bin", handler="rt_depth", args={"eid": 142, "format": "png"})
+
+
+def test_draws_targets_depth_tga() -> None:
+    m = resolve_path("/draws/142/targets/depth.tga")
+    assert m == PathMatch(kind="leaf_bin", handler="rt_depth", args={"eid": 142, "format": "tga"})
 
 
 # ── Phase 2 edge / error cases ─────────────────────────────────────

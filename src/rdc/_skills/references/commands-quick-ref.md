@@ -890,7 +890,7 @@ List all resources.
 
 ## `rdc rt`
 
-Export render target as PNG.
+Export render target as PNG/TGA.
 
 **Arguments:**
 
@@ -904,7 +904,8 @@ Export render target as PNG.
 |------|------|------|---------|
 | `-o, --output` | Write to file | path |  |
 | `--target` | Color target index (default 0); mutually exclusive with --depth | integer |  |
-| `--depth` | Export the raw depth attachment texture (/draws/<eid>/targets/depth.png); distinct from --overlay depth, which renders RenderDoc's depth overlay visualization. Ignored when --overlay is set. | flag |  |
+| `--depth` | Export the raw depth attachment texture (/draws/<eid>/targets/depth.<format>); distinct from --overlay depth, which renders RenderDoc's depth overlay visualization. Ignored when --overlay is set. | flag |  |
+| `--format` | Image format for the export (default: png; ignored with --overlay) | choice | png |
 | `--raw` | Force raw output even on TTY | flag |  |
 | `--overlay` | Render with debug overlay | choice |  |
 | `--width` | Overlay render width | integer | 256 |
@@ -1192,7 +1193,7 @@ Show texture min/max statistics and optional histogram.
 
 ## `rdc texture`
 
-Export texture as PNG.
+Export texture as PNG/TGA.
 
 **Arguments:**
 
@@ -1206,6 +1207,7 @@ Export texture as PNG.
 |------|------|------|---------|
 | `-o, --output` | Write to file | path |  |
 | `--mip` | Mip level (default 0) | integer | 0 |
+| `--format` | Image format for the export (default: png) | choice | png |
 | `--raw` | Force raw output even on TTY | flag |  |
 
 ## `rdc thumbnail`

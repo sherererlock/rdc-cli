@@ -242,13 +242,13 @@ def _build_shader_cache(state: DaemonState) -> None:
         populate_shaders_subtree(state.vfs_tree, state.shader_meta)
 
 
-def _make_texsave(rd: Any, resource_id: Any, mip: int = 0) -> Any:
+def _make_texsave(rd: Any, resource_id: Any, mip: int = 0, image_format: str = "png") -> Any:
     """Create a TextureSave object using the renderdoc module."""
     ts = rd.TextureSave()
     ts.resourceId = resource_id
     ts.mip = mip
     ts.slice = rd.TextureSliceMapping()
-    ts.destType = rd.FileType.PNG
+    ts.destType = rd.FileType.TGA if image_format == "tga" else rd.FileType.PNG
     return ts
 
 
@@ -347,8 +347,21 @@ def _unpack_r9g9b9e5(words: Any) -> Any:
     return np.stack([rm * scale, gm * scale, bm * scale], axis=-1).astype(np.float32)
 
 
-def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bool) -> bytes | None:
-    """Decode tightly packed GetTextureData bytes into PNG bytes.
+def _pil_format(image_format: str) -> str:
+    """PIL format name for an export format string ("png"/"tga")."""
+    return "TGA" if image_format == "tga" else "PNG"
+
+
+def _decode_texture_png(
+    rd: Any,
+    tex: Any,
+    raw: bytes,
+    mip: int,
+    *,
+    is_depth: bool,
+    image_format: str = "png",
+) -> bytes | None:
+    """Decode tightly packed GetTextureData bytes into PNG/TGA bytes.
 
     Handles the full ``ResourceFormatType.Regular`` space deliberately: every
     (CompType, compByteWidth) pair we can display is mapped to a numpy dtype and
@@ -371,7 +384,8 @@ def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bo
     byte-for-byte identical to the 2D path.
 
     Returns:
-        PNG-encoded bytes, or ``None`` if the format cannot be decoded.
+        Image-encoded bytes (PNG or TGA per *image_format*), or ``None`` if
+        the format cannot be decoded.
     """
     import io
 
@@ -407,7 +421,7 @@ def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bo
         rgb8 = (_srgb_encode(f) * 255.0).round().astype(np.uint8)
         out = np.concatenate([rgb8, alpha], axis=2)
         buf = io.BytesIO()
-        Image.fromarray(out, mode="RGBA").save(buf, format="PNG")
+        Image.fromarray(out, mode="RGBA").save(buf, format=_pil_format(image_format))
         return buf.getvalue()
 
     if fmt.type != rd.ResourceFormatType.Regular:
@@ -437,7 +451,7 @@ def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bo
         norm = (d - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(d)
         gray = (norm * 255.0).round().astype(np.uint8)
         buf = io.BytesIO()
-        Image.fromarray(gray, mode="L").save(buf, format="PNG")
+        Image.fromarray(gray, mode="L").save(buf, format=_pil_format(image_format))
         return buf.getvalue()
 
     if ct == int(rd.CompType.Float):
@@ -476,7 +490,7 @@ def _decode_texture_png(rd: Any, tex: Any, raw: bytes, mip: int, *, is_depth: bo
         out = rgba8
 
     buf = io.BytesIO()
-    Image.fromarray(out, mode="RGBA").save(buf, format="PNG")
+    Image.fromarray(out, mode="RGBA").save(buf, format=_pil_format(image_format))
     return buf.getvalue()
 
 

@@ -57,6 +57,31 @@ class TestTextureCmd:
         vfs_calls = [c for c in calls if c[0] == "vfs_ls"]
         assert any("/textures/42/mips/2.png" in str(c) for c in vfs_calls)
 
+    def test_texture_format_tga_path(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """--format tga should construct /textures/<id>/image.tga (and .tga mips)."""
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append((method, dict(params) if params else {}))
+            if method == "vfs_ls":
+                return {"kind": "leaf_bin", "path": params.get("path", "/") if params else "/"}
+            temp = tmp_path / "export.bin"
+            temp.write_bytes(b"\x00TGA" + b"\x00" * 50)
+            return {"path": str(temp), "size": 53}
+
+        monkeypatch.setattr("rdc.commands.export.call", mock_call)
+        monkeypatch.setattr("rdc.commands.vfs.call", mock_call)
+        monkeypatch.setattr("rdc.commands.vfs._stdout_is_tty", lambda: False)
+        out_file = tmp_path / "out.tga"
+        runner = click.testing.CliRunner()
+        result = runner.invoke(
+            texture_cmd, ["42", "--format", "tga", "--mip", "1", "-o", str(out_file)]
+        )
+        assert result.exit_code == 0
+        vfs_calls = [c for c in calls if c[0] == "vfs_ls"]
+        assert any("/textures/42/mips/1.tga" in str(c) for c in vfs_calls)
+        assert not any(".png" in str(c) for c in vfs_calls)
+
     def test_texture_tty_protection(self, monkeypatch: Any, tmp_path: Path) -> None:
         mock = _make_mockcall(tmp_path)
         monkeypatch.setattr("rdc.commands.export.call", mock)
@@ -110,6 +135,31 @@ class TestRtCmd:
         assert result.exit_code == 0
         vfs_calls = [c for c in calls if c[0] == "vfs_ls"]
         assert any("/draws/100/targets/color2.png" in str(c) for c in vfs_calls)
+
+    def test_rt_format_tga_path(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """--format tga should construct /draws/<eid>/targets/color0.tga."""
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def mock_call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append((method, dict(params) if params else {}))
+            if method == "vfs_ls":
+                return {"kind": "leaf_bin", "path": params.get("path", "/") if params else "/"}
+            temp = tmp_path / "export.bin"
+            temp.write_bytes(b"\x00TGA" + b"\x00" * 50)
+            return {"path": str(temp), "size": 53}
+
+        monkeypatch.setattr("rdc.commands.export.call", mock_call)
+        monkeypatch.setattr("rdc.commands.vfs.call", mock_call)
+        monkeypatch.setattr("rdc.commands.vfs._stdout_is_tty", lambda: False)
+        out_file = tmp_path / "rt.tga"
+        runner = click.testing.CliRunner()
+        result = runner.invoke(
+            rt_cmd, ["100", "--format", "tga", "--target", "1", "-o", str(out_file)]
+        )
+        assert result.exit_code == 0
+        vfs_calls = [c for c in calls if c[0] == "vfs_ls"]
+        assert any("/draws/100/targets/color1.tga" in str(c) for c in vfs_calls)
+        assert not any(".png" in str(c) for c in vfs_calls)
 
     def test_rt_depth_routes_to_depth_png(self, monkeypatch: Any, tmp_path: Path) -> None:
         calls: list[tuple[str, dict[str, Any]]] = []

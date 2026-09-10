@@ -304,7 +304,7 @@ class TestTextureBufferSkeleton:
     def test_texture_node_structure(self, typed_skeleton: VfsTree) -> None:
         node = typed_skeleton.static["/textures/5"]
         assert node.kind == "dir"
-        assert node.children == ["info", "image.png", "mips", "data"]
+        assert node.children == ["info", "image.png", "image.tga", "mips", "data"]
 
     def test_texture_info_leaf(self, typed_skeleton: VfsTree) -> None:
         assert typed_skeleton.static["/textures/5/info"].kind == "leaf"
@@ -312,19 +312,27 @@ class TestTextureBufferSkeleton:
     def test_texture_image_leaf_bin(self, typed_skeleton: VfsTree) -> None:
         assert typed_skeleton.static["/textures/5/image.png"].kind == "leaf_bin"
 
+    def test_texture_image_tga_leaf_bin(self, typed_skeleton: VfsTree) -> None:
+        assert typed_skeleton.static["/textures/5/image.tga"].kind == "leaf_bin"
+
     def test_texture_data_leaf_bin(self, typed_skeleton: VfsTree) -> None:
         assert typed_skeleton.static["/textures/5/data"].kind == "leaf_bin"
 
     def test_texture_mips_4(self, typed_skeleton: VfsTree) -> None:
         mips = typed_skeleton.static["/textures/5/mips"]
         assert mips.kind == "dir"
-        assert mips.children == ["0.png", "1.png", "2.png", "3.png"]
+        assert mips.children == [
+            "0.png", "0.tga", "1.png", "1.tga", "2.png", "2.tga", "3.png", "3.tga",
+        ]
 
     def test_texture_mip_leaf_bin(self, typed_skeleton: VfsTree) -> None:
         assert typed_skeleton.static["/textures/5/mips/0.png"].kind == "leaf_bin"
 
+    def test_texture_mip_tga_leaf_bin(self, typed_skeleton: VfsTree) -> None:
+        assert typed_skeleton.static["/textures/5/mips/0.tga"].kind == "leaf_bin"
+
     def test_texture_mips_1(self, typed_skeleton: VfsTree) -> None:
-        assert typed_skeleton.static["/textures/10/mips"].children == ["0.png"]
+        assert typed_skeleton.static["/textures/10/mips"].children == ["0.png", "0.tga"]
 
     def test_buffers_children(self, typed_skeleton: VfsTree) -> None:
         assert typed_skeleton.static["/buffers"].children == ["20"]
@@ -384,8 +392,11 @@ class TestDrawTargetsSubtree:
         populate_draw_subtree(skel, 10, pipe)
         assert skel.static["/draws/10/targets"].children == [
             "color0.png",
+            "color0.tga",
             "color1.png",
+            "color1.tga",
             "depth.png",
+            "depth.tga",
         ]
 
     def test_target_color_leaf_bin(self, skel: VfsTree) -> None:
@@ -393,10 +404,20 @@ class TestDrawTargetsSubtree:
         populate_draw_subtree(skel, 10, pipe)
         assert skel.static["/draws/10/targets/color0.png"].kind == "leaf_bin"
 
+    def test_target_color_tga_leaf_bin(self, skel: VfsTree) -> None:
+        pipe = _make_pipe_with_targets()
+        populate_draw_subtree(skel, 10, pipe)
+        assert skel.static["/draws/10/targets/color0.tga"].kind == "leaf_bin"
+
     def test_target_depth_leaf_bin(self, skel: VfsTree) -> None:
         pipe = _make_pipe_with_targets()
         populate_draw_subtree(skel, 10, pipe)
         assert skel.static["/draws/10/targets/depth.png"].kind == "leaf_bin"
+
+    def test_target_depth_tga_leaf_bin(self, skel: VfsTree) -> None:
+        pipe = _make_pipe_with_targets()
+        populate_draw_subtree(skel, 10, pipe)
+        assert skel.static["/draws/10/targets/depth.tga"].kind == "leaf_bin"
 
     def test_no_targets(self, skel: VfsTree) -> None:
         pipe = MockPipeState()
@@ -408,7 +429,7 @@ class TestDrawTargetsSubtree:
             output_targets=[Descriptor(resource=ResourceId(300))],
         )
         populate_draw_subtree(skel, 10, pipe)
-        assert skel.static["/draws/10/targets"].children == ["color0.png"]
+        assert skel.static["/draws/10/targets"].children == ["color0.png", "color0.tga"]
 
     def test_lru_eviction_cleans_target_nodes(self) -> None:
         skel = build_vfs_skeleton(_make_actions(), _make_resources())

@@ -211,16 +211,18 @@ def build_vfs_skeleton(
     for t in _textures:
         rid = str(int(getattr(t, "resourceId", 0)))
         prefix = f"/textures/{rid}"
-        tex_children = ["info", "image.png", "mips", "data"]
+        tex_children = ["info", "image.png", "image.tga", "mips", "data"]
         tree.static[prefix] = VfsNode(rid, "dir", list(tex_children))
         tree.static[f"{prefix}/info"] = VfsNode("info", "leaf")
         tree.static[f"{prefix}/image.png"] = VfsNode("image.png", "leaf_bin")
+        tree.static[f"{prefix}/image.tga"] = VfsNode("image.tga", "leaf_bin")
         tree.static[f"{prefix}/data"] = VfsNode("data", "leaf_bin")
         mip_count = getattr(t, "mips", 1)
-        mip_children = [f"{i}.png" for i in range(mip_count)]
+        mip_children = [f"{i}.{ext}" for i in range(mip_count) for ext in ("png", "tga")]
         tree.static[f"{prefix}/mips"] = VfsNode("mips", "dir", list(mip_children))
         for i in range(mip_count):
             tree.static[f"{prefix}/mips/{i}.png"] = VfsNode(f"{i}.png", "leaf_bin")
+            tree.static[f"{prefix}/mips/{i}.tga"] = VfsNode(f"{i}.tga", "leaf_bin")
 
     # /buffers
     buf_ids = [str(int(getattr(b, "resourceId", 0))) for b in _buffers]
@@ -301,15 +303,17 @@ def populate_draw_subtree(
         color_targets = [t.resource for t in pipe_state.GetOutputTargets() if int(t.resource) != 0]
     for i, resource in enumerate(color_targets):
         if int(resource) != 0:
-            name = f"color{i}.png"
-            target_children.append(name)
-            tree.static[f"{targets_path}/{name}"] = VfsNode(name, "leaf_bin")
+            for ext in ("png", "tga"):
+                name = f"color{i}.{ext}"
+                target_children.append(name)
+                tree.static[f"{targets_path}/{name}"] = VfsNode(name, "leaf_bin")
 
     if depth_target is None:
         depth_target = pipe_state.GetDepthTarget().resource
     if depth_target is not None and int(depth_target) != 0:
-        target_children.append("depth.png")
-        tree.static[f"{targets_path}/depth.png"] = VfsNode("depth.png", "leaf_bin")
+        for ext in ("png", "tga"):
+            target_children.append(f"depth.{ext}")
+            tree.static[f"{targets_path}/depth.{ext}"] = VfsNode(f"depth.{ext}", "leaf_bin")
 
     tree.static[targets_path].children = list(target_children)
     subtree[targets_path] = list(target_children)

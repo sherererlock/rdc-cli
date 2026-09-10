@@ -137,6 +137,7 @@ rdc shaders --name "GBuffer*"
 rdc rt EID -o output.png
 rdc rt EID --depth -o depth.png      # export the raw depth attachment
 rdc texture ID -o tex.png            # export a texture by resource ID (PNG)
+rdc texture ID --format tga -o tex.tga  # export as TGA (asset-reimport format)
 ```
 
 ### Decode a constant buffer
