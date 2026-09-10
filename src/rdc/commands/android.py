@@ -280,6 +280,11 @@ def _resolve_device(ctrl: Any, devices: list[str], serial: str | None) -> str:
         target = f"adb://{serial}"
         if target in devices:
             return target
+        # RenderDoc's adb controller may return bare serials instead of
+        # "adb://SERIAL" URLs depending on version; match either form.
+        for d in devices:
+            if d == serial or d.rsplit("://", 1)[-1] == serial:
+                return d
         click.echo(f"error: device {serial!r} not found", err=True)
         click.echo("available devices:", err=True)
         for d in devices:
